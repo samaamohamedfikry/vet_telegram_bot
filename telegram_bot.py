@@ -1,5 +1,5 @@
 """
-Telegram-only study-materials administration system with Real-time Auto-Save to GitHub.
+Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub.
 """
 
 from __future__ import annotations
@@ -123,9 +123,12 @@ DB = sqlite3.connect(database_path(), check_same_thread=False)
 DB.row_factory = sqlite3.Row
 DB.execute("PRAGMA foreign_keys = ON")
 
+GIT_SYNC_LOCK = threading.Lock()
 
 def sync_github_worker():
-    """حفظ التغييرات في مستودع GitHub فوراً في الخلفية"""
+    """يحفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
+    if not GIT_SYNC_LOCK.acquire(blocking=False):
+        return
     try:
         subprocess.run(["git", "config", "--global", "user.name", "GitHub Action Bot"], check=False)
         subprocess.run(["git", "config", "--global", "user.email", "action@github.com"], check=False)
@@ -137,10 +140,11 @@ def sync_github_worker():
             subprocess.run(["git", "push", "origin", "main"], check=False)
     except Exception as e:
         logger.error(f"Error syncing to GitHub: {e}")
+    finally:
+        GIT_SYNC_LOCK.release()
 
 
 def trigger_realtime_save():
-    """تشغيل الحفظ في خيط (Thread) منفصل لمنع أي بطء في استجابة البوت"""
     threading.Thread(target=sync_github_worker, daemon=True).start()
 
 
@@ -206,10 +210,7 @@ def track_user(user_id: int, username: str | None, first_name: str | None) -> No
         (user_id, username or ""),
     )
     if first_name is not None:
-        db_execute(
-            "UPDATE users SET first_name = ? WHERE user_id = ?",
-            (first_name, user_id),
-        )
+        db_execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
 
 
 def log_user_activity(user_id: int, action_type: str, item_title: str) -> None:
