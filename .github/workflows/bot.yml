@@ -1,4 +1,4 @@
-name: Run Telegram Bot
+name: Run Telegram Bot with Auto-Save
 
 on:
   push:
@@ -10,6 +10,8 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -24,8 +26,16 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run Bot (with timeout)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_ID }}
-        run: python telegram_bot.py
+        run: |
+          timeout 5h python telegram_bot.py || true
+
+      - name: Auto-Save Database
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action@github.com"
+          git add bot.sqlite3
+          git diff-index --quiet HEAD || (git commit -m "Auto-save database [skip ci]" && git push)
