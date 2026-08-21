@@ -306,10 +306,22 @@ def normalize_username(value: str) -> str:
     return value.strip().lstrip("@").lower()
 
 
+def is_super_admin(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
+    configured_ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
+    return str(user.id) in configured_ids
+
+
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     if user is None:
         return False
+
+    if is_super_admin(update):
+        return True
 
     username = (user.username or "").lower()
     row = db_one(
@@ -430,9 +442,13 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         [ADD_CONTENT],
         [EDIT_CONTENT, DELETE_CONTENT],
         [BROADCAST_BUTTON, STATS_BUTTON],
-        [MANAGE_ADMINS, WELCOME_SETTINGS],
-        [BACK_TO_MENU],
     ]
+
+    if is_super_admin(update):
+        rows.append([MANAGE_ADMINS, WELCOME_SETTINGS])
+
+    rows.append([BACK_TO_MENU])
+
     location = node_title(current_node_id(context))
     await message.reply_text(
         tr(context, "admin_location", loc=location),
@@ -589,16 +605,18 @@ async def show_admin_selection(
     message = update.effective_message
     if message is None:
         return
+    
+    raw_super_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
+    super_ids = {int(x.strip()) for x in raw_super_ids.split(",") if x.strip().isdigit()}
+
     admins = db_all(
         "SELECT id, user_id, username, display_name FROM admins ORDER BY id"
     )
-    if not admins:
-        await message.reply_text("لا يوجد مشرفون مسجلون.")
-        await show_admin_management(update, context)
-        return
-
+    
     labels: dict[str, int] = {}
     for admin in admins:
+        if admin["user_id"] in super_ids:
+            continue
         identity = (
             f"@{admin['username']}"
             if admin["username"]
@@ -606,6 +624,12 @@ async def show_admin_selection(
         )
         label = display_label("👤", identity, admin["id"])
         labels[label] = admin["id"]
+
+    if not labels:
+        await message.reply_text("لا يوجد مشرفون إضافيون لحذفهم.")
+        await show_admin_management(update, context)
+        return
+
     add_selection_map(context, labels)
     set_flow(context, "remove_admin")
     await message.reply_text(
@@ -970,6 +994,11 @@ async def process_admin_flow(
         return True
 
     if flow_type == "add_admin":
+        if not is_super_admin(update):
+            clear_flow(context)
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            await show_admin_panel(update, context)
+            return True
         value = text.strip()
         if value.startswith("@") or not value.isdigit():
             username = normalize_username(value)
@@ -1000,6 +1029,11 @@ async def process_admin_flow(
         return True
 
     if flow_type == "remove_admin":
+        if not is_super_admin(update):
+            clear_flow(context)
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            await show_admin_panel(update, context)
+            return True
         admin_id = context.user_data.get("selection_map", {}).get(text)
         if not admin_id:
             await message.reply_text("اختر مشرفاً من لوحة المفاتيح أو اضغط إلغاء.")
@@ -1017,6 +1051,11 @@ async def process_admin_flow(
         return True
 
     if flow_type == "welcome_message":
+        if not is_super_admin(update):
+            clear_flow(context)
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            await show_admin_panel(update, context)
+            return True
         if not text:
             await message.reply_text("أرسل رسالة الترحيب كنص.")
             return True
@@ -1179,9 +1218,15 @@ async def handle_navigation(
         await show_content_selection(update, context, "delete_content")
         return
     if text == MANAGE_ADMINS and is_admin(update):
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
         await show_admin_management(update, context)
         return
     if text == ADD_ADMIN and is_admin(update):
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
         set_flow(context, "add_admin")
         await message.reply_text(
             "أرسل User ID الرقمي أو username مثل @example.",
@@ -1189,9 +1234,15 @@ async def handle_navigation(
         )
         return
     if text == REMOVE_ADMIN and is_admin(update):
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
         await show_admin_selection(update, context)
         return
     if text == LIST_ADMINS and is_admin(update):
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
         admins = db_all(
             "SELECT user_id, username, display_name FROM admins ORDER BY id"
         )
@@ -1207,6 +1258,9 @@ async def handle_navigation(
         await show_admin_management(update, context)
         return
     if text == WELCOME_SETTINGS and is_admin(update):
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
         current = db_one(
             "SELECT value FROM settings WHERE key = ?", ("welcome_message",)
         )
