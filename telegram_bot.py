@@ -1,5 +1,5 @@
 """
-Telegram-only study-materials administration system with Multi-language support.
+Telegram-only study-materials administration system with Multi-language support & Activity Tracking.
 """
 
 from __future__ import annotations
@@ -90,6 +90,8 @@ WELCOME_SETTINGS = "رسالة الترحيب"
 ARRANGE_BUTTONS = "ترتيب الأزرار"
 BROADCAST_BUTTON = "📢 إذاعة للدفعة"
 STATS_BUTTON = "📊 إحصائيات البوت"
+USERS_LIST_BUTTON = "👥 قائمة المشتركين"
+ACTIVITY_LOG_BUTTON = "📈 سجل النشاط والضغطات"
 
 UP = "أعلى ⬆️"
 DOWN = "أسفل ⬇️"
@@ -180,6 +182,16 @@ def track_user(user_id: int, username: str | None, first_name: str | None) -> No
     )
 
 
+def log_user_activity(user_id: int, action_type: str, item_title: str) -> None:
+    db_execute(
+        """
+        INSERT INTO user_activity (user_id, action_type, item_title)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, action_type, item_title),
+    )
+
+
 def initialize_database() -> None:
     with DB:
         DB.executescript(
@@ -231,6 +243,14 @@ def initialize_database() -> None:
                 language TEXT NOT NULL DEFAULT 'ar',
                 joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                item_title TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -445,6 +465,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
 
     if is_super_admin(update):
+        rows.append([USERS_LIST_BUTTON, ACTIVITY_LOG_BUTTON])
         rows.append([MANAGE_ADMINS, WELCOME_SETTINGS])
 
     rows.append([BACK_TO_MENU])
@@ -760,6 +781,8 @@ async def process_admin_flow(
             await message.reply_text("يرجى إرسال كلمة البحث كنص.")
             return True
         clear_flow(context)
+        if update.effective_user:
+            log_user_activity(update.effective_user.id, "🔍 بحث", text[:50])
         await perform_search(update, context, text)
         await show_node(update, context)
         return True
@@ -1207,6 +1230,42 @@ async def handle_navigation(
         )
         await show_admin_panel(update, context)
         return
+
+    if text == USERS_LIST_BUTTON and is_super_admin(update):
+        users = db_all("SELECT user_id, username, first_name, joined_at FROM users ORDER BY joined_at DESC LIMIT 50")
+        if not users:
+            await message.reply_text("لا يوجد مستخدمون مسجلون بعد.")
+            return
+        lines = ["👥 قائمة آخر الطلاب المشتركين:\n"]
+        for u in users:
+            uname = f"@{u['username']}" if u["username"] else "بدون يوزر"
+            name = u["first_name"] or "مجهول"
+            lines.append(f"• {name} ({uname}) | ID: `{u['user_id']}`")
+        await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await show_admin_panel(update, context)
+        return
+
+    if text == ACTIVITY_LOG_BUTTON and is_super_admin(update):
+        logs = db_all(
+            """
+            SELECT ua.action_type, ua.item_title, ua.created_at, u.first_name, u.username
+            FROM user_activity ua
+            LEFT JOIN users u ON ua.user_id = u.user_id
+            ORDER BY ua.id DESC
+            LIMIT 30
+            """
+        )
+        if not logs:
+            await message.reply_text("لا يوجد نشاط مسجل للطلاب بعد.")
+            return
+        lines = ["📈 سجل آخر ضغطات ونشاط الطلاب:\n"]
+        for log in logs:
+            uname = f"@{log['username']}" if log["username"] else (log["first_name"] or "طالب")
+            lines.append(f"• {uname} ⬅️ فتح: {log['item_title']} ({log['action_type']})")
+        await message.reply_text("\n".join(lines))
+        await show_admin_panel(update, context)
+        return
+
     if text == ADD_CONTENT and is_admin(update):
         set_flow(context, "add_content_title")
         await message.reply_text("أرسل عنوان المحتوى أولاً.", reply_markup=keyboard([[tr(context, "cancel")]]))
@@ -1277,10 +1336,12 @@ async def handle_navigation(
         selection_type, item_id = selection
         if selection_type == "node":
             child = db_one(
-                "SELECT id FROM menu_nodes WHERE id = ? AND parent_id IS ?",
+                "SELECT id, title FROM menu_nodes WHERE id = ? AND parent_id IS ?",
                 (item_id, current_node_id(context)),
             )
             if child:
+                if update.effective_user and not is_admin(update):
+                    log_user_activity(update.effective_user.id, "قسم / زر", child["title"])
                 path.append(item_id)
                 await show_node(update, context)
                 return
@@ -1290,6 +1351,8 @@ async def handle_navigation(
                 (item_id, current_node_id(context)),
             )
             if content:
+                if update.effective_user and not is_admin(update):
+                    log_user_activity(update.effective_user.id, "محاضرة / ملف", content["title"])
                 await deliver_content(update, content)
                 return
 
