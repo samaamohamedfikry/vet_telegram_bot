@@ -1,5 +1,5 @@
 """
-Telegram-only study-materials administration system with Multi-language support & Activity Tracking.
+Telegram-only study-materials administration system with Real-time Auto-Save to GitHub.
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -122,9 +124,33 @@ DB.row_factory = sqlite3.Row
 DB.execute("PRAGMA foreign_keys = ON")
 
 
+def sync_github_worker():
+    """حفظ التغييرات في مستودع GitHub فوراً في الخلفية"""
+    try:
+        subprocess.run(["git", "config", "--global", "user.name", "GitHub Action Bot"], check=False)
+        subprocess.run(["git", "config", "--global", "user.email", "action@github.com"], check=False)
+        subprocess.run(["git", "add", "bot.sqlite3"], check=False)
+        res = subprocess.run(["git", "diff-index", "--quiet", "HEAD"], check=False)
+        if res.returncode != 0:
+            subprocess.run(["git", "commit", "-m", "Realtime auto-save DB [skip ci]"], check=False)
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+            subprocess.run(["git", "push", "origin", "main"], check=False)
+    except Exception as e:
+        logger.error(f"Error syncing to GitHub: {e}")
+
+
+def trigger_realtime_save():
+    """تشغيل الحفظ في خيط (Thread) منفصل لمنع أي بطء في استجابة البوت"""
+    threading.Thread(target=sync_github_worker, daemon=True).start()
+
+
 def db_execute(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
     with DB:
-        return DB.execute(query, parameters)
+        cursor = DB.execute(query, parameters)
+    q = query.strip().upper()
+    if q.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
+        trigger_realtime_save()
+    return cursor
 
 
 def db_one(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -171,15 +197,19 @@ def menu_items(node_id: int | None) -> list[sqlite3.Row]:
 def track_user(user_id: int, username: str | None, first_name: str | None) -> None:
     db_execute(
         """
-        INSERT INTO users (user_id, username, first_name, language)
-        VALUES (?, ?, ?, 'ar')
+        INSERT INTO users (user_id, username, language)
+        VALUES (?, ?, 'ar')
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
-            first_name = excluded.first_name,
             last_seen = CURRENT_TIMESTAMP
         """,
-        (user_id, username or "", first_name or ""),
+        (user_id, username or ""),
     )
+    if first_name is not None:
+        db_execute(
+            "UPDATE users SET first_name = ? WHERE user_id = ?",
+            (first_name, user_id),
+        )
 
 
 def log_user_activity(user_id: int, action_type: str, item_title: str) -> None:
@@ -557,6 +587,7 @@ def move_menu_item(
             f"UPDATE {target_table} SET sort_order = ? WHERE id = ?",
             (current["sort_order"], target["id"]),
         )
+    trigger_realtime_save()
     return True
 
 
