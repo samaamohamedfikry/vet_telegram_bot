@@ -5,7 +5,6 @@ on:
     branches: [ main ]
   workflow_dispatch:
   schedule:
-    # إعادة تشغيل تلقائي كل 5 ساعات لضمان استمراره دون توقف
     - cron: '0 */5 * * *'
 
 jobs:
@@ -16,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
