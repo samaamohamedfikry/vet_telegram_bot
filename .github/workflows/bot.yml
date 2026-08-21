@@ -5,18 +5,17 @@ on:
     branches: [ main ]
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */5 * * *'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,15 +24,21 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Fix Database File Permissions
+        run: |
+          touch bot.sqlite3
+          chmod 777 bot.sqlite3 || true
+          chmod 777 . || true
 
       - name: Run Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_ID }}
         run: |
-          timeout 285m python telegram_bot.py || true
+          python telegram_bot.py
 
       - name: Auto-Save Database
         if: always()
@@ -41,8 +46,5 @@ jobs:
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
           git add bot.sqlite3
-          git diff-index --quiet HEAD || {
-            git commit -m "Auto-save database [skip ci]"
-            git pull --rebase origin main
-            git push origin main
-          }
+          git diff-index --quiet HEAD || (git commit -m "Auto-save DB on exit [skip ci]" && git pull --rebase origin main && git push origin main)
+          
