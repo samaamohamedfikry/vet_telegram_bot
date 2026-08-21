@@ -26,6 +26,6 @@ jobs:
 
       - name: Run Bot
         env:
-          TELEGRAM_BOT_TOKEN: "8862865656:AAFg9gTHF-a7_-oOlaFn__rEV8AeVTZmxFw"
+          TELEGRAM_BOT_TOKEN: "8862865656:AAFg9gTHF-a7_-o0laFn__rEV8AeVTZmxFw"
           ADMIN_USER_IDS: "5731687491"
         run: python telegram_bot.py
