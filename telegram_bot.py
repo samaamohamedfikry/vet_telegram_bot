@@ -126,7 +126,7 @@ DB.execute("PRAGMA foreign_keys = ON")
 GIT_SYNC_LOCK = threading.Lock()
 
 def sync_github_worker():
-    """يحفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
+    """حفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
     if not GIT_SYNC_LOCK.acquire(blocking=False):
         return
     try:
@@ -1264,16 +1264,26 @@ async def handle_navigation(
         return
 
     if text == USERS_LIST_BUTTON and is_super_admin(update):
-        users = db_all("SELECT user_id, username, first_name, joined_at FROM users ORDER BY joined_at DESC LIMIT 50")
+        users = db_all(
+            "SELECT user_id, username, first_name, joined_at FROM users ORDER BY joined_at DESC"
+        )
         if not users:
             await message.reply_text("لا يوجد مستخدمون مسجلون بعد.")
             return
-        lines = ["👥 قائمة آخر الطلاب المشتركين:\n"]
-        for u in users:
+        
+        current_chunk = f"👥 إجمالي الطلاب المشتركين: {len(users)}\n\n"
+        for i, u in enumerate(users, 1):
             uname = f"@{u['username']}" if u["username"] else "بدون يوزر"
-            name = u["first_name"] or "مجهول"
-            lines.append(f"• {name} ({uname}) | ID: `{u['user_id']}`")
-        await message.reply_text("\n".join(lines), parse_mode="Markdown")
+            name = (u["first_name"] or "مجهول").replace("`", "")
+            line = f"{i}. {name} ({uname}) | ID: `{u['user_id']}`\n"
+            if len(current_chunk) + len(line) > 3900:
+                await message.reply_text(current_chunk, parse_mode="Markdown")
+                current_chunk = ""
+            current_chunk += line
+            
+        if current_chunk:
+            await message.reply_text(current_chunk, parse_mode="Markdown")
+            
         await show_admin_panel(update, context)
         return
 
