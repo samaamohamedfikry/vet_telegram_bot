@@ -34,6 +34,10 @@ DB_ENV_VAR = "BOT_DB_PATH"
 LANG_AR = "ar"
 LANG_EN = "en"
 
+CANCEL = "إلغاء"
+CONFIRM = "تأكيد"
+SKIP = "تخطي"
+
 STRINGS = {
     LANG_AR: {
         "main_menu": "القائمة الرئيسية",
@@ -707,13 +711,22 @@ async def process_admin_flow(
         return False
 
     text = message.text.strip() if message.text else ""
-    if text in {tr(context, "cancel"), CANCEL, "Cancel"}:
+    cancel_words = {
+        tr(context, "cancel"),
+        CANCEL,
+        "Cancel",
+        "الغاء",
+        "إلغاء",
+        "القائمة الرئيسية",
+        "Main Menu",
+        "/cancel",
+    }
+    
+    if text in cancel_words:
         clear_flow(context)
+        context.user_data["menu_path"] = []
         await message.reply_text(tr(context, "canceled"))
-        if is_admin(update):
-            await show_admin_panel(update, context)
-        else:
-            await show_node(update, context)
+        await show_node(update, context)
         return True
 
     flow_type = flow["type"]
