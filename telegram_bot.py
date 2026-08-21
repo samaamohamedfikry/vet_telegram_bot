@@ -1,0 +1,1262 @@
+"""
+Telegram-only study-materials administration system with Multi-language support.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN"
+ADMIN_IDS_ENV_VAR = "ADMIN_USER_IDS"
+DB_ENV_VAR = "BOT_DB_PATH"
+
+LANG_AR = "ar"
+LANG_EN = "en"
+
+STRINGS = {
+    LANG_AR: {
+        "main_menu": "القائمة الرئيسية",
+        "back": "رجوع",
+        "admin_menu": "لوحة الإدارة",
+        "cancel": "إلغاء",
+        "confirm": "تأكيد",
+        "skip": "تخطي",
+        "search_btn": "🔍 بحث سريع",
+        "lang_btn": "🌐 English",
+        "choose_lang": "اختر اللغة / Choose language:",
+        "lang_changed": "تم تغيير اللغة إلى العربية بنجاح.",
+        "search_prompt": "🔎 أرسل اسم المادة أو المحاضرة التي تبحث عنها:",
+        "search_results": "🔍 نتائج البحث عن: {query}",
+        "no_search_results": "عفواً، لم أجد نتائج مطابقة لبحثك.",
+        "select_from_menu": "اختر من القائمة:",
+        "admin_location": "لوحة الإدارة\nالموقع الحالي: {loc}\n\nاختر إجراءً:",
+        "no_permission": "ليس لديك صلاحية للوصول إلى لوحة الإدارة.",
+        "canceled": "تم الإلغاء.",
+    },
+    LANG_EN: {
+        "main_menu": "Main Menu",
+        "back": "Back",
+        "admin_menu": "Admin Panel",
+        "cancel": "Cancel",
+        "confirm": "Confirm",
+        "skip": "Skip",
+        "search_btn": "🔍 Search",
+        "lang_btn": "🌐 عربي",
+        "choose_lang": "Choose language / اختر اللغة:",
+        "lang_changed": "Language changed to English successfully.",
+        "search_prompt": "🔎 Send the name of the material or lecture to search for:",
+        "search_results": "🔍 Search results for: {query}",
+        "no_search_results": "Sorry, no results matched your search.",
+        "select_from_menu": "Select from menu:",
+        "admin_location": "Admin Panel\nCurrent Location: {loc}\n\nChoose an action:",
+        "no_permission": "You do not have admin permissions.",
+        "canceled": "Canceled.",
+    }
+}
+
+ADD_BUTTON = "إضافة زر"
+EDIT_CURRENT_BUTTON = "تعديل هذا الزر"
+DELETE_CURRENT_BUTTON = "حذف هذا الزر"
+ADD_CONTENT = "إضافة محتوى"
+EDIT_CONTENT = "تعديل محتوى"
+DELETE_CONTENT = "حذف محتوى"
+MANAGE_ADMINS = "إدارة المشرفين"
+WELCOME_SETTINGS = "رسالة الترحيب"
+ARRANGE_BUTTONS = "ترتيب الأزرار"
+BROADCAST_BUTTON = "📢 إذاعة للدفعة"
+STATS_BUTTON = "📊 إحصائيات البوت"
+
+UP = "أعلى ⬆️"
+DOWN = "أسفل ⬇️"
+LEFT = "يسار ⬅️"
+RIGHT = "يمين ➡️"
+TOGGLE_LAYOUT = "تبديل عرض الزر"
+BACK_TO_MENU = "العودة للقائمة"
+ADD_ADMIN = "إضافة مشرف"
+REMOVE_ADMIN = "حذف مشرف"
+LIST_ADMINS = "قائمة المشرفين"
+BACK_TO_ADMIN = "العودة للوحة الإدارة"
+
+DEFAULT_WELCOME = (
+    "مساء الجمال والكريستال ❤️\n"
+    "يا اهلا بالدكتور {first_name} 🥼\n\n"
+    "اختر من القائمة للوصول إلى المواد الدراسية:"
+)
+
+
+def database_path() -> Path:
+    path = Path(os.getenv(DB_ENV_VAR, "bot.sqlite3"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DB = sqlite3.connect(database_path(), check_same_thread=False)
+DB.row_factory = sqlite3.Row
+DB.execute("PRAGMA foreign_keys = ON")
+
+
+def db_execute(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+    with DB:
+        return DB.execute(query, parameters)
+
+
+def db_one(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+    return db_execute(query, parameters).fetchone()
+
+
+def db_all(query: str, parameters: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    return db_execute(query, parameters).fetchall()
+
+
+def get_user_lang(user_id: int) -> str:
+    row = db_one("SELECT language FROM users WHERE user_id = ?", (user_id,))
+    if row and row["language"]:
+        return row["language"]
+    return LANG_AR
+
+
+def set_user_lang(user_id: int, lang: str) -> None:
+    db_execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, user_id))
+
+
+def tr(context: ContextTypes.DEFAULT_TYPE, key: str, **kwargs: Any) -> str:
+    lang = context.user_data.get("lang", LANG_AR)
+    text = STRINGS.get(lang, STRINGS[LANG_AR]).get(key, "")
+    return text.format(**kwargs) if kwargs else text
+
+
+def menu_items(node_id: int | None) -> list[sqlite3.Row]:
+    return db_all(
+        """
+        SELECT id, title, sort_order, layout_mode, 'node' AS item_type
+        FROM menu_nodes
+        WHERE parent_id IS ?
+        UNION ALL
+        SELECT id, title, sort_order, layout_mode, 'content' AS item_type
+        FROM contents
+        WHERE node_id IS ?
+        ORDER BY sort_order, item_type, id
+        """,
+        (node_id, node_id),
+    )
+
+
+def track_user(user_id: int, username: str | None, first_name: str | None) -> None:
+    db_execute(
+        """
+        INSERT INTO users (user_id, username, first_name, language)
+        VALUES (?, ?, ?, 'ar')
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_seen = CURRENT_TIMESTAMP
+        """,
+        (user_id, username or "", first_name or ""),
+    )
+
+
+def initialize_database() -> None:
+    with DB:
+        DB.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS menu_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER REFERENCES menu_nodes(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                layout_mode TEXT NOT NULL DEFAULT 'half',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS menu_nodes_parent_idx
+                ON menu_nodes(parent_id, sort_order, id);
+
+            CREATE TABLE IF NOT EXISTS contents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id INTEGER REFERENCES menu_nodes(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                layout_mode TEXT NOT NULL DEFAULT 'half',
+                content_type TEXT NOT NULL,
+                file_id TEXT,
+                text_value TEXT,
+                created_by INTEGER NOT NULL,
+                source_chat_id INTEGER,
+                source_message_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS contents_node_idx
+                ON contents(node_id, id);
+
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                username TEXT UNIQUE,
+                display_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (user_id IS NOT NULL OR username IS NOT NULL)
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                language TEXT NOT NULL DEFAULT 'ar',
+                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        user_cols = {row["name"] for row in DB.execute("PRAGMA table_info(users)")}
+        if "language" not in user_cols:
+            DB.execute("ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'ar'")
+
+        DB.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+            ("welcome_message", DEFAULT_WELCOME),
+        )
+
+
+def bootstrap_admins() -> None:
+    raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
+    configured_ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
+    existing = db_one("SELECT id FROM admins LIMIT 1")
+
+    if not existing and not configured_ids:
+        raise RuntimeError(
+            f"Set {ADMIN_IDS_ENV_VAR} to at least one Telegram user ID before the first run."
+        )
+
+    for raw_id in configured_ids:
+        try:
+            user_id = int(raw_id)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid admin user ID in {ADMIN_IDS_ENV_VAR}: {raw_id}"
+            ) from error
+        db_execute(
+            """
+            INSERT INTO admins(user_id, display_name)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, f"User {user_id}"),
+        )
+
+
+def keyboard(rows: list[list[str]]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def current_path(context: ContextTypes.DEFAULT_TYPE) -> list[int]:
+    return context.user_data.setdefault("menu_path", [])
+
+
+def current_node_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    path = current_path(context)
+    return path[-1] if path else None
+
+
+def set_flow(context: ContextTypes.DEFAULT_TYPE, flow_type: str, **values: Any) -> None:
+    context.user_data["flow"] = {"type": flow_type, **values}
+
+
+def get_flow(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
+    return context.user_data.get("flow")
+
+
+def clear_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("flow", None)
+    context.user_data.pop("selection_map", None)
+
+
+def normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+
+    username = (user.username or "").lower()
+    row = db_one(
+        """
+        SELECT id, user_id
+        FROM admins
+        WHERE user_id = ? OR (username IS NOT NULL AND lower(username) = ?)
+        LIMIT 1
+        """,
+        (user.id, username),
+    )
+    if not row:
+        return False
+
+    if row["user_id"] is None:
+        db_execute("UPDATE admins SET user_id = ? WHERE id = ?", (user.id, row["id"]))
+    return True
+
+
+def welcome_message(update: Update) -> str:
+    template_row = db_one(
+        "SELECT value FROM settings WHERE key = ?", ("welcome_message",)
+    )
+    template = template_row["value"] if template_row else DEFAULT_WELCOME
+    user = update.effective_user
+    if user is None:
+        return template
+
+    replacements = {
+        "{first_name}": user.first_name or "",
+        "{last_name}": user.last_name or "",
+        "{username}": f"@{user.username}" if user.username else "",
+        "{user_id}": str(user.id),
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template
+
+
+def node_title(node_id: int | None) -> str:
+    if node_id is None:
+        return "الرئيسية"
+    row = db_one("SELECT title FROM menu_nodes WHERE id = ?", (node_id,))
+    return row["title"] if row else "الرئيسية"
+
+
+def display_label(prefix: str, title: str, item_id: int) -> str:
+    return title
+
+
+def add_selection_map(
+    context: ContextTypes.DEFAULT_TYPE, labels_to_ids: dict[str, int]
+) -> None:
+    context.user_data["selection_map"] = labels_to_ids
+
+
+async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    node_id = current_node_id(context)
+    rows: list[list[str]] = []
+    menu_selection_map: dict[str, tuple[str, int]] = {}
+    half_row: list[str] = []
+    for item in menu_items(node_id):
+        label = display_label("", item["title"], item["id"])
+        menu_selection_map[label] = (item["item_type"], item["id"])
+        if item["layout_mode"] == "full":
+            if half_row:
+                rows.append(half_row)
+                half_row = []
+            rows.append([label])
+        else:
+            half_row.append(label)
+            if len(half_row) == 2:
+                rows.append(half_row)
+                half_row = []
+    if half_row:
+        rows.append(half_row)
+    context.user_data["menu_selection_map"] = menu_selection_map
+
+    navigation_row = []
+    if node_id is not None:
+        navigation_row.extend([tr(context, "back"), tr(context, "main_menu")])
+    elif current_path(context):
+        navigation_row.append(tr(context, "main_menu"))
+
+    if navigation_row:
+        rows.append(navigation_row)
+
+    if node_id is None:
+        rows.append([tr(context, "search_btn"), tr(context, "lang_btn")])
+
+    if is_admin(update):
+        rows.append([tr(context, "admin_menu")])
+
+    description = node_title(node_id)
+    if node_id is None:
+        description = tr(context, "main_menu")
+    await message.reply_text(
+        f"{description}\n\n{tr(context, 'select_from_menu')}",
+        reply_markup=keyboard(rows or [[tr(context, "main_menu")]]),
+    )
+
+
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+
+    rows = [
+        [ADD_BUTTON],
+        [EDIT_CURRENT_BUTTON, DELETE_CURRENT_BUTTON],
+        [ARRANGE_BUTTONS],
+        [ADD_CONTENT],
+        [EDIT_CONTENT, DELETE_CONTENT],
+        [BROADCAST_BUTTON, STATS_BUTTON],
+        [MANAGE_ADMINS, WELCOME_SETTINGS],
+        [BACK_TO_MENU],
+    ]
+    location = node_title(current_node_id(context))
+    await message.reply_text(
+        tr(context, "admin_location", loc=location),
+        reply_markup=keyboard(rows),
+    )
+
+
+async def show_arrange_selection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    items = menu_items(current_node_id(context))
+    if not items:
+        await message.reply_text(
+            "لا توجد أزرار لترتيبها في هذا المكان.",
+            reply_markup=keyboard([[BACK_TO_ADMIN]]),
+        )
+        return
+    labels: dict[str, tuple[str, int]] = {}
+    for item in items:
+        label = display_label("", item["title"], item["id"])
+        labels[label] = (item["item_type"], item["id"])
+    context.user_data["selection_map"] = labels
+    set_flow(context, "arrange_select")
+    await message.reply_text(
+        "اختر الزر الذي تريد ترتيبَه:",
+        reply_markup=keyboard([[label] for label in labels] + [[tr(context, "cancel")]]),
+    )
+
+
+async def show_arrange_controls(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, item_type: str, item_id: int
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    table = "menu_nodes" if item_type == "node" else "contents"
+    item = db_one(
+        f"SELECT title, layout_mode FROM {table} WHERE id = ?", (item_id,)
+    )
+    if item is None:
+        clear_flow(context)
+        await message.reply_text("هذا الزر لم يعد موجوداً.")
+        await show_admin_panel(update, context)
+        return
+    layout = "عرض كامل" if item["layout_mode"] == "full" else "نصف عرض"
+    await message.reply_text(
+        f"الزر: {item['title']}\nالتخطيط الحالي: {layout}\n\n"
+        "اختر اتجاه الحركة أو غيّر عرض الزر:",
+        reply_markup=keyboard(
+            [[UP, DOWN], [LEFT, RIGHT], [TOGGLE_LAYOUT], [BACK_TO_ADMIN]]
+        ),
+    )
+
+
+def move_menu_item(
+    node_id: int | None, item_type: str, item_id: int, offset: int
+) -> bool:
+    items = menu_items(node_id)
+    current_index = next(
+        (
+            index
+            for index, item in enumerate(items)
+            if item["item_type"] == item_type and item["id"] == item_id
+        ),
+        None,
+    )
+    if current_index is None:
+        return False
+    target_index = current_index + offset
+    if target_index < 0 or target_index >= len(items):
+        return False
+    current = items[current_index]
+    target = items[target_index]
+    current_table = "menu_nodes" if item_type == "node" else "contents"
+    target_table = "menu_nodes" if target["item_type"] == "node" else "contents"
+    with DB:
+        DB.execute(
+            f"UPDATE {current_table} SET sort_order = ? WHERE id = ?",
+            (target["sort_order"], item_id),
+        )
+        DB.execute(
+            f"UPDATE {target_table} SET sort_order = ? WHERE id = ?",
+            (current["sort_order"], target["id"]),
+        )
+    return True
+
+
+def toggle_menu_item_layout(item_type: str, item_id: int) -> str:
+    table = "menu_nodes" if item_type == "node" else "contents"
+    item = db_one(f"SELECT layout_mode FROM {table} WHERE id = ?", (item_id,))
+    if item is None:
+        return "half"
+    new_layout = "full" if item["layout_mode"] != "full" else "half"
+    db_execute(
+        f"UPDATE {table} SET layout_mode = ? WHERE id = ?",
+        (new_layout, item_id),
+    )
+    return new_layout
+
+
+async def show_admin_management(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "إدارة المشرفين:",
+        reply_markup=keyboard(
+            [
+                [ADD_ADMIN],
+                [REMOVE_ADMIN],
+                [LIST_ADMINS],
+                [BACK_TO_ADMIN],
+            ]
+        ),
+    )
+
+
+async def show_content_selection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    contents = db_all(
+        "SELECT id, title FROM contents WHERE node_id IS ? ORDER BY id",
+        (current_node_id(context),),
+    )
+    if not contents:
+        await message.reply_text(
+            "لا يوجد محتوى في هذا الزر بعد.",
+            reply_markup=keyboard([[BACK_TO_ADMIN]]),
+        )
+        return
+
+    labels = {
+        display_label("📄", row["title"], row["id"]): row["id"] for row in contents
+    }
+    add_selection_map(context, labels)
+    set_flow(context, action)
+    await message.reply_text(
+        "اختر المحتوى:",
+        reply_markup=keyboard([[label] for label in labels] + [[tr(context, "cancel")]]),
+    )
+
+
+async def show_admin_selection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    admins = db_all(
+        "SELECT id, user_id, username, display_name FROM admins ORDER BY id"
+    )
+    if not admins:
+        await message.reply_text("لا يوجد مشرفون مسجلون.")
+        await show_admin_management(update, context)
+        return
+
+    labels: dict[str, int] = {}
+    for admin in admins:
+        identity = (
+            f"@{admin['username']}"
+            if admin["username"]
+            else f"ID {admin['user_id']}"
+        )
+        label = display_label("👤", identity, admin["id"])
+        labels[label] = admin["id"]
+    add_selection_map(context, labels)
+    set_flow(context, "remove_admin")
+    await message.reply_text(
+        "اختر المشرف الذي تريد حذفه:",
+        reply_markup=keyboard([[label] for label in labels] + [[tr(context, "cancel")]]),
+    )
+
+
+def content_from_message(message: Any) -> tuple[str, str] | None:
+    if message.document:
+        return "document", message.document.file_id
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    if message.text:
+        text = message.text.strip()
+        if re.match(r"^https?://\S+$", text):
+            return "link", text
+        return "text", text
+    return None
+
+
+async def deliver_content(update: Update, content: sqlite3.Row) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    title = content["title"]
+    content_type = content["content_type"]
+    value = content["file_id"] or content["text_value"] or ""
+
+    if content_type == "document":
+        await message.reply_document(document=value, caption=title)
+    elif content_type == "photo":
+        await message.reply_photo(photo=value, caption=title)
+    elif content_type == "video":
+        await message.reply_video(video=value, caption=title)
+    elif content_type == "audio":
+        await message.reply_audio(audio=value, caption=title)
+    elif content_type == "link":
+        await message.reply_text(f"{title}\n\n{value}", disable_web_page_preview=False)
+    else:
+        await message.reply_text(f"{title}\n\n{value}")
+
+
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    results = db_all(
+        """
+        SELECT * FROM contents
+        WHERE title LIKE ?
+        LIMIT 10
+        """,
+        (f"%{query}%",),
+    )
+    if not results:
+        await update.effective_message.reply_text(tr(context, "no_search_results"))
+        return
+
+    await update.effective_message.reply_text(tr(context, "search_results", query=query))
+    for content in results:
+        await deliver_content(update, content)
+
+
+async def send_broadcast(application: Application, message: Any) -> tuple[int, int]:
+    users = db_all("SELECT user_id FROM users")
+    success = 0
+    fail = 0
+    for user_row in users:
+        user_id = user_row["user_id"]
+        try:
+            if message.text:
+                await application.bot.send_message(
+                    chat_id=user_id, text=f"📢 إشعار هام من الإدارة:\n\n{message.text}"
+                )
+            elif message.photo:
+                await application.bot.send_photo(
+                    chat_id=user_id,
+                    photo=message.photo[-1].file_id,
+                    caption=f"📢 {message.caption or ''}",
+                )
+            elif message.document:
+                await application.bot.send_document(
+                    chat_id=user_id,
+                    document=message.document.file_id,
+                    caption=f"📢 {message.caption or ''}",
+                )
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    return success, fail
+
+
+async def process_admin_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    flow = get_flow(context)
+    message = update.effective_message
+    if not flow or message is None:
+        return False
+
+    text = message.text.strip() if message.text else ""
+    if text in {tr(context, "cancel"), CANCEL, "Cancel"}:
+        clear_flow(context)
+        await message.reply_text(tr(context, "canceled"))
+        if is_admin(update):
+            await show_admin_panel(update, context)
+        else:
+            await show_node(update, context)
+        return True
+
+    flow_type = flow["type"]
+
+    if flow_type == "search":
+        if not text:
+            await message.reply_text("يرجى إرسال كلمة البحث كنص.")
+            return True
+        clear_flow(context)
+        await perform_search(update, context, text)
+        await show_node(update, context)
+        return True
+
+    if not is_admin(update):
+        return False
+
+    if flow_type == "broadcast":
+        clear_flow(context)
+        status_msg = await message.reply_text("⏳ جاري إرسال الإذاعة لجميع الطلاب...")
+        succ, fail = await send_broadcast(context.application, message)
+        await status_msg.edit_text(
+            f"✅ تم إرسال الإذاعة بنجاح!\n\n• وصل إلى: {succ} طالب\n• فشل: {fail}"
+        )
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "arrange_select":
+        selection = context.user_data.get("selection_map", {}).get(text)
+        if not selection:
+            await message.reply_text("اختر زرّاً من لوحة المفاتيح أو اضغط إلغاء.")
+            return True
+        item_type, item_id = selection
+        set_flow(
+            context,
+            "arrange_controls",
+            item_type=item_type,
+            item_id=item_id,
+        )
+        await show_arrange_controls(update, context, item_type, item_id)
+        return True
+
+    if flow_type == "arrange_controls":
+        item_type = flow["item_type"]
+        item_id = flow["item_id"]
+        if text in {UP, DOWN, LEFT, RIGHT}:
+            offset = -1 if text in {UP, LEFT} else 1
+            moved = move_menu_item(
+                current_node_id(context), item_type, item_id, offset
+            )
+            await message.reply_text(
+                "تم تحريك الزر." if moved else "لا يمكن تحريك الزر في هذا الاتجاه."
+            )
+            await show_arrange_controls(update, context, item_type, item_id)
+            return True
+        if text == TOGGLE_LAYOUT:
+            layout = toggle_menu_item_layout(item_type, item_id)
+            await message.reply_text(
+                "تم ضبط الزر بعرض كامل."
+                if layout == "full"
+                else "تم ضبط الزر بعرض نصف الصف."
+            )
+            await show_arrange_controls(update, context, item_type, item_id)
+            return True
+        if text == BACK_TO_ADMIN:
+            clear_flow(context)
+            await show_admin_panel(update, context)
+            return True
+        await message.reply_text("اختر إجراءً من لوحة الترتيب.")
+        return True
+
+    if flow_type == "add_button":
+        if not text:
+            await message.reply_text("أرسل اسم الزر كنص.")
+            return True
+        parent_id = current_node_id(context)
+        items = menu_items(parent_id)
+        next_order = max((item["sort_order"] for item in items), default=-1) + 1
+        db_execute(
+            """
+            INSERT INTO menu_nodes(parent_id, title, sort_order, layout_mode)
+            VALUES (?, ?, ?, 'half')
+            """,
+            (parent_id, text[:64], next_order),
+        )
+        clear_flow(context)
+        await message.reply_text("تمت إضافة الزر.")
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "edit_node_title":
+        if not text:
+            await message.reply_text("أرسل الاسم الجديد.")
+            return True
+        db_execute(
+            "UPDATE menu_nodes SET title = ? WHERE id = ?",
+            (text[:64], flow["node_id"]),
+        )
+        clear_flow(context)
+        await message.reply_text("تم تعديل الزر.")
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "confirm_delete_node":
+        if text not in {CONFIRM, "Confirm", "تأكيد"}:
+            await message.reply_text("اكتب تأكيد للحذف أو إلغاء.")
+            return True
+        node_id = flow["node_id"]
+        db_execute("DELETE FROM menu_nodes WHERE id = ?", (node_id,))
+        path = current_path(context)
+        if path and path[-1] == node_id:
+            path.pop()
+        clear_flow(context)
+        await message.reply_text("تم حذف الزر وكل ما بداخله.")
+        await show_node(update, context)
+        return True
+
+    if flow_type == "add_content_title":
+        if not text:
+            await message.reply_text("أرسل عنوان المحتوى.")
+            return True
+        set_flow(
+            context,
+            "add_content_value",
+            title=text[:100],
+            node_id=current_node_id(context),
+        )
+        await message.reply_text(
+            "أرسل الملف أو الصورة أو الفيديو أو الصوت أو الرابط أو النص الآن.",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return True
+
+    if flow_type == "add_content_value":
+        content = content_from_message(message)
+        if content is None:
+            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً.")
+            return True
+        content_type, value = content
+        user = update.effective_user
+        db_execute(
+            """
+            INSERT INTO contents(
+                node_id, title, sort_order, layout_mode, content_type,
+                file_id, text_value,
+                created_by, source_chat_id, source_message_id
+            ) VALUES (?, ?, ?, 'half', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                flow["node_id"],
+                flow["title"],
+                max(
+                    (item["sort_order"] for item in menu_items(flow["node_id"])),
+                    default=-1,
+                )
+                + 1,
+                content_type,
+                value if content_type in {"document", "photo", "video", "audio"} else None,
+                value if content_type in {"text", "link"} else None,
+                user.id if user else 0,
+                message.chat_id,
+                message.message_id,
+            ),
+        )
+        clear_flow(context)
+        await message.reply_text("تمت إضافة المحتوى.")
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type in {"edit_content", "delete_content"}:
+        selection_map = context.user_data.get("selection_map", {})
+        content_id = selection_map.get(text)
+        if not content_id:
+            await message.reply_text("اختر عنصراً من لوحة المفاتيح أو اضغط إلغاء.")
+            return True
+        if flow_type == "delete_content":
+            set_flow(context, "confirm_delete_content", content_id=content_id)
+            await message.reply_text(
+                "اكتب تأكيد لحذف هذا المحتوى أو إلغاء.",
+                reply_markup=keyboard([[CONFIRM], [tr(context, "cancel")]]),
+            )
+        else:
+            set_flow(context, "edit_content_title", content_id=content_id)
+            await message.reply_text(
+                "أرسل العنوان الجديد، أو اكتب تخطي للاحتفاظ بالعنوان الحالي."
+            )
+        return True
+
+    if flow_type == "confirm_delete_content":
+        if text not in {CONFIRM, "Confirm", "تأكيد"}:
+            await message.reply_text("اكتب تأكيد للحذف أو إلغاء.")
+            return True
+        db_execute("DELETE FROM contents WHERE id = ?", (flow["content_id"],))
+        clear_flow(context)
+        await message.reply_text("تم حذف المحتوى.")
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "edit_content_title":
+        if text != SKIP and not text:
+            await message.reply_text("أرسل عنواناً أو اكتب تخطي.")
+            return True
+        if text != SKIP:
+            db_execute(
+                "UPDATE contents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (text[:100], flow["content_id"]),
+            )
+        set_flow(context, "edit_content_value", content_id=flow["content_id"])
+        await message.reply_text(
+            "أرسل المحتوى الجديد، أو اكتب تخطي للاحتفاظ بالمحتوى الحالي."
+        )
+        return True
+
+    if flow_type == "edit_content_value":
+        if text == SKIP:
+            clear_flow(context)
+            await message.reply_text("تم تعديل المحتوى.")
+            await show_admin_panel(update, context)
+            return True
+        content = content_from_message(message)
+        if content is None:
+            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً، أو اكتب تخطي.")
+            return True
+        content_type, value = content
+        db_execute(
+            """
+            UPDATE contents
+            SET content_type = ?, file_id = ?, text_value = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                content_type,
+                value if content_type in {"document", "photo", "video", "audio"} else None,
+                value if content_type in {"text", "link"} else None,
+                flow["content_id"],
+            ),
+        )
+        clear_flow(context)
+        await message.reply_text("تم تعديل المحتوى.")
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "add_admin":
+        value = text.strip()
+        if value.startswith("@") or not value.isdigit():
+            username = normalize_username(value)
+            if not re.fullmatch(r"[a-zA-Z0-9_]{5,32}", username):
+                await message.reply_text("أرسل User ID رقمي أو username صحيحاً مثل @user.")
+                return True
+            try:
+                db_execute(
+                    "INSERT INTO admins(username, display_name) VALUES (?, ?)",
+                    (username, f"@{username}"),
+                )
+            except sqlite3.IntegrityError:
+                await message.reply_text("هذا المشرف موجود بالفعل.")
+                return True
+        else:
+            user_id = int(value)
+            try:
+                db_execute(
+                    "INSERT INTO admins(user_id, display_name) VALUES (?, ?)",
+                    (user_id, f"User {user_id}"),
+                )
+            except sqlite3.IntegrityError:
+                await message.reply_text("هذا المشرف موجود بالفعل.")
+                return True
+        clear_flow(context)
+        await message.reply_text("تمت إضافة المشرف.")
+        await show_admin_management(update, context)
+        return True
+
+    if flow_type == "remove_admin":
+        admin_id = context.user_data.get("selection_map", {}).get(text)
+        if not admin_id:
+            await message.reply_text("اختر مشرفاً من لوحة المفاتيح أو اضغط إلغاء.")
+            return True
+        admin_count = db_one("SELECT COUNT(*) AS count FROM admins")["count"]
+        if admin_count <= 1:
+            clear_flow(context)
+            await message.reply_text("لا يمكن حذف آخر مشرف.")
+            await show_admin_management(update, context)
+            return True
+        db_execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+        clear_flow(context)
+        await message.reply_text("تم حذف المشرف.")
+        await show_admin_management(update, context)
+        return True
+
+    if flow_type == "welcome_message":
+        if not text:
+            await message.reply_text("أرسل رسالة الترحيب كنص.")
+            return True
+        db_execute(
+            """
+            INSERT INTO settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("welcome_message", text),
+        )
+        clear_flow(context)
+        await message.reply_text(
+            "تم حفظ رسالة الترحيب. يمكنك استخدام {first_name} و {username} و {user_id}."
+        )
+        await show_admin_panel(update, context)
+        return True
+
+    clear_flow(context)
+    await show_admin_panel(update, context)
+    return True
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_flow(context)
+    context.user_data["menu_path"] = []
+    if update.effective_user:
+        user_id = update.effective_user.id
+        track_user(
+            user_id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
+        context.user_data["lang"] = get_user_lang(user_id)
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(welcome_message(update))
+    await show_node(update, context)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    set_flow(context, "search")
+    await update.effective_message.reply_text(
+        tr(context, "search_prompt"),
+        reply_markup=keyboard([[tr(context, "cancel")]]),
+    )
+
+
+async def handle_navigation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    text = message.text.strip()
+    path = current_path(context)
+
+    if update.effective_user:
+        user_id = update.effective_user.id
+        track_user(
+            user_id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+        )
+        if "lang" not in context.user_data:
+            context.user_data["lang"] = get_user_lang(user_id)
+
+    if text in {STRINGS[LANG_AR]["lang_btn"], STRINGS[LANG_EN]["lang_btn"]}:
+        new_lang = LANG_EN if context.user_data.get("lang") == LANG_AR else LANG_AR
+        context.user_data["lang"] = new_lang
+        if update.effective_user:
+            set_user_lang(update.effective_user.id, new_lang)
+        await message.reply_text(tr(context, "lang_changed"))
+        await show_node(update, context)
+        return
+
+    if text in {STRINGS[LANG_AR]["main_menu"], STRINGS[LANG_EN]["main_menu"]}:
+        context.user_data["menu_path"] = []
+        await show_node(update, context)
+        return
+    if text in {STRINGS[LANG_AR]["back"], STRINGS[LANG_EN]["back"]}:
+        if path:
+            path.pop()
+        await show_node(update, context)
+        return
+    if text in {STRINGS[LANG_AR]["search_btn"], STRINGS[LANG_EN]["search_btn"]}:
+        await search_command(update, context)
+        return
+    if text in {STRINGS[LANG_AR]["admin_menu"], STRINGS[LANG_EN]["admin_menu"]}:
+        if is_admin(update):
+            await show_admin_panel(update, context)
+        else:
+            await message.reply_text(tr(context, "no_permission"))
+        return
+
+    if text == BACK_TO_MENU:
+        clear_flow(context)
+        await show_node(update, context)
+        return
+    if text == BACK_TO_ADMIN:
+        clear_flow(context)
+        await show_admin_panel(update, context)
+        return
+
+    if text == ADD_BUTTON and is_admin(update):
+        set_flow(context, "add_button")
+        await message.reply_text(
+            f"أرسل اسم الزر الجديد داخل: {node_title(current_node_id(context))}",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return
+    if text == EDIT_CURRENT_BUTTON and is_admin(update):
+        node_id = current_node_id(context)
+        if node_id is None:
+            await message.reply_text("لا يمكن تعديل القائمة الرئيسية.")
+        else:
+            set_flow(context, "edit_node_title", node_id=node_id)
+            await message.reply_text("أرسل الاسم الجديد للزر.", reply_markup=keyboard([[tr(context, "cancel")]]))
+        return
+    if text == DELETE_CURRENT_BUTTON and is_admin(update):
+        node_id = current_node_id(context)
+        if node_id is None:
+            await message.reply_text("لا يمكن حذف القائمة الرئيسية.")
+        else:
+            set_flow(context, "confirm_delete_node", node_id=node_id)
+            await message.reply_text(
+                "سيتم حذف الزر وكل المحتوى والأزرار بداخله. اكتب تأكيد للمتابعة.",
+                reply_markup=keyboard([[CONFIRM], [tr(context, "cancel")]]),
+            )
+        return
+    if text == ARRANGE_BUTTONS and is_admin(update):
+        await show_arrange_selection(update, context)
+        return
+    if text == BROADCAST_BUTTON and is_admin(update):
+        set_flow(context, "broadcast")
+        await message.reply_text(
+            "📢 أرسل الرسالة أو الإشعار (نص، صورة، أو ملف) ليتم بثه لجميع الطلاب المشتركين:",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return
+    if text == STATS_BUTTON and is_admin(update):
+        user_count = db_one("SELECT COUNT(*) AS total FROM users")["total"]
+        node_count = db_one("SELECT COUNT(*) AS total FROM menu_nodes")["total"]
+        content_count = db_one("SELECT COUNT(*) AS total FROM contents")["total"]
+        await message.reply_text(
+            f"📊 إحصائيات البوت:\n\n"
+            f"👥 عدد الطلاب المشتركين: {user_count}\n"
+            f"📁 عدد الأقسام والمواد: {node_count}\n"
+            f"📄 إجمالي الملفات والمحاضرات: {content_count}"
+        )
+        await show_admin_panel(update, context)
+        return
+    if text == ADD_CONTENT and is_admin(update):
+        set_flow(context, "add_content_title")
+        await message.reply_text("أرسل عنوان المحتوى أولاً.", reply_markup=keyboard([[tr(context, "cancel")]]))
+        return
+    if text == EDIT_CONTENT and is_admin(update):
+        await show_content_selection(update, context, "edit_content")
+        return
+    if text == DELETE_CONTENT and is_admin(update):
+        await show_content_selection(update, context, "delete_content")
+        return
+    if text == MANAGE_ADMINS and is_admin(update):
+        await show_admin_management(update, context)
+        return
+    if text == ADD_ADMIN and is_admin(update):
+        set_flow(context, "add_admin")
+        await message.reply_text(
+            "أرسل User ID الرقمي أو username مثل @example.",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return
+    if text == REMOVE_ADMIN and is_admin(update):
+        await show_admin_selection(update, context)
+        return
+    if text == LIST_ADMINS and is_admin(update):
+        admins = db_all(
+            "SELECT user_id, username, display_name FROM admins ORDER BY id"
+        )
+        lines = []
+        for admin in admins:
+            identity = (
+                f"@{admin['username']}"
+                if admin["username"]
+                else f"ID {admin['user_id']}"
+            )
+            lines.append(f"• {identity} — {admin['display_name']}")
+        await message.reply_text("\n".join(lines) or "لا يوجد مشرفون.")
+        await show_admin_management(update, context)
+        return
+    if text == WELCOME_SETTINGS and is_admin(update):
+        current = db_one(
+            "SELECT value FROM settings WHERE key = ?", ("welcome_message",)
+        )
+        set_flow(context, "welcome_message")
+        await message.reply_text(
+            f"رسالة الترحيب الحالية:\n\n{current['value'] if current else DEFAULT_WELCOME}\n\n"
+            "أرسل الرسالة الجديدة. يمكنك استخدام {first_name}.",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return
+
+    selection = context.user_data.get("menu_selection_map", {}).get(text)
+    if selection:
+        selection_type, item_id = selection
+        if selection_type == "node":
+            child = db_one(
+                "SELECT id FROM menu_nodes WHERE id = ? AND parent_id IS ?",
+                (item_id, current_node_id(context)),
+            )
+            if child:
+                path.append(item_id)
+                await show_node(update, context)
+                return
+        elif selection_type == "content":
+            content = db_one(
+                "SELECT * FROM contents WHERE id = ? AND node_id IS ?",
+                (item_id, current_node_id(context)),
+            )
+            if content:
+                await deliver_content(update, content)
+                return
+
+    await message.reply_text(tr(context, "select_from_menu"))
+    await show_node(update, context)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if get_flow(context):
+        handled = await process_admin_flow(update, context)
+        if handled:
+            return
+    await handle_navigation(update, context)
+
+
+def build_application() -> Application:
+    token = os.getenv(TOKEN_ENV_VAR)
+    if not token:
+        raise RuntimeError(
+            f"Set {TOKEN_ENV_VAR} before running the bot. Create the token with BotFather."
+        )
+
+    initialize_database()
+    bootstrap_admins()
+
+    application = Application.builder().token(token).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("cancel", start))
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
+    )
+    return application
+
+
+if __name__ == "__main__":
+    build_application().run_polling(allowed_updates=Update.ALL_TYPES)
