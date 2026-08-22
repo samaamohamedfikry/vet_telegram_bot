@@ -5,13 +5,14 @@ on:
     branches: [ main ]
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */5 * * *' # تشغيل مجدول احتياطي
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: Checkout code
@@ -33,12 +34,12 @@ jobs:
           chmod 777 bot.sqlite3 || true
           chmod 777 . || true
 
-      - name: Run Bot
+      - name: Run Bot (Safe 5.5h Session)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_ID }}
         run: |
-          python telegram_bot.py
+          timeout 19800s python telegram_bot.py || true
 
       - name: Auto-Save Database
         if: always()
@@ -46,5 +47,15 @@ jobs:
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
           git add bot.sqlite3
-          git diff-index --quiet HEAD || (git commit -m "Auto-save DB on exit [skip ci]" && git pull --rebase origin main && git push origin main)
-          
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Auto-save DB on exit [skip ci]"
+            git pull --rebase origin main || true
+            git push origin main || true
+          fi
+
+      - name: Trigger Next Session (24/7 Loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Run Telegram Bot with Auto-Save" || true
