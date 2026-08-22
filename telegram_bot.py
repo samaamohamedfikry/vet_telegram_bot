@@ -1,10 +1,11 @@
 """
-Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub & Multi-file Upload.
+Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub & Multi-Attachment Single Button.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -127,7 +128,7 @@ DB.execute("PRAGMA foreign_keys = ON")
 GIT_SYNC_LOCK = threading.Lock()
 
 def sync_github_worker():
-    """حفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
+    """يحفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
     if not GIT_SYNC_LOCK.acquire(blocking=False):
         return
     try:
@@ -709,6 +710,24 @@ def content_from_message(message: Any) -> tuple[str, str] | None:
     return None
 
 
+async def deliver_single_item(message: Any, c_type: str, c_val: str, caption: str) -> None:
+    try:
+        if c_type == "document":
+            await message.reply_document(document=c_val, caption=caption)
+        elif c_type == "photo":
+            await message.reply_photo(photo=c_val, caption=caption)
+        elif c_type == "video":
+            await message.reply_video(video=c_val, caption=caption)
+        elif c_type == "audio":
+            await message.reply_audio(audio=c_val, caption=caption)
+        elif c_type == "link":
+            await message.reply_text(f"{caption}\n\n{c_val}", disable_web_page_preview=False)
+        else:
+            await message.reply_text(f"{caption}\n\n{c_val}")
+    except Exception as e:
+        logger.error(f"Error delivering item: {e}")
+
+
 async def deliver_content(update: Update, content: sqlite3.Row) -> None:
     message = update.effective_message
     if message is None:
@@ -716,20 +735,22 @@ async def deliver_content(update: Update, content: sqlite3.Row) -> None:
 
     title = content["title"]
     content_type = content["content_type"]
-    value = content["file_id"] or content["text_value"] or ""
 
-    if content_type == "document":
-        await message.reply_document(document=value, caption=title)
-    elif content_type == "photo":
-        await message.reply_photo(photo=value, caption=title)
-    elif content_type == "video":
-        await message.reply_video(video=value, caption=title)
-    elif content_type == "audio":
-        await message.reply_audio(audio=value, caption=title)
-    elif content_type == "link":
-        await message.reply_text(f"{title}\n\n{value}", disable_web_page_preview=False)
+    if content_type == "multi":
+        items = []
+        try:
+            items = json.loads(content["text_value"] or "[]")
+        except Exception:
+            pass
+        for i, item in enumerate(items):
+            c_type = item.get("type", "text")
+            c_val = item.get("value", "")
+            sub_caption = f"{title}" if i == 0 else f"{title} (مرفق {i+1})"
+            await deliver_single_item(message, c_type, c_val, sub_caption)
+            await asyncio.sleep(0.1)
     else:
-        await message.reply_text(f"{title}\n\n{value}")
+        value = content["file_id"] or content["text_value"] or ""
+        await deliver_single_item(message, content_type, value, title)
 
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
@@ -932,22 +953,71 @@ async def process_admin_flow(
             "add_content_value",
             title=text[:100],
             node_id=current_node_id(context),
-            saved_count=0,
+            items=[],
         )
         await message.reply_text(
-            "أرسل الملفات الآن (يمكنك إرسال أكثر من ملف).\nعند الانتهاء اضغط على «✅ تم إنهاء الرفع».",
+            f"تم تحديد الزر: {text}\n\nأرسل الملفات أو الروابط الآن واحداً تلو الآخر (سيتم جمعهم معاً في نفس الزر).\nعند الانتهاء اضغط على «✅ تم إنهاء الرفع».",
             reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
         return True
 
     if flow_type == "add_content_value":
         if text == DONE_UPLOAD:
-            count = flow.get("saved_count", 0)
-            clear_flow(context)
-            if count > 0:
-                await message.reply_text(f"✅ تم حفظ {count} ملف/عنصر بنجاح.")
+            items_list = flow.get("items", [])
+            if not items_list:
+                await message.reply_text("لم يتم إرسال أي ملفات أو روابط. تم الإلغاء.")
+                clear_flow(context)
+                await show_admin_panel(update, context)
+                return True
+
+            user = update.effective_user
+            node_id = flow["node_id"]
+
+            if len(items_list) == 1:
+                content_type = items_list[0]["type"]
+                val = items_list[0]["value"]
+                db_execute(
+                    """
+                    INSERT INTO contents(
+                        node_id, title, sort_order, layout_mode, content_type,
+                        file_id, text_value,
+                        created_by, source_chat_id, source_message_id
+                    ) VALUES (?, ?, ?, 'half', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        node_id,
+                        flow["title"],
+                        max((item["sort_order"] for item in menu_items(node_id)), default=-1) + 1,
+                        content_type,
+                        val if content_type in {"document", "photo", "video", "audio"} else None,
+                        val if content_type in {"text", "link"} else None,
+                        user.id if user else 0,
+                        message.chat_id,
+                        message.message_id,
+                    ),
+                )
             else:
-                await message.reply_text("لم يتم إرسال أي ملفات.")
+                db_execute(
+                    """
+                    INSERT INTO contents(
+                        node_id, title, sort_order, layout_mode, content_type,
+                        file_id, text_value,
+                        created_by, source_chat_id, source_message_id
+                    ) VALUES (?, ?, ?, 'half', 'multi', NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        node_id,
+                        flow["title"],
+                        max((item["sort_order"] for item in menu_items(node_id)), default=-1) + 1,
+                        json.dumps(items_list, ensure_ascii=False),
+                        user.id if user else 0,
+                        message.chat_id,
+                        message.message_id,
+                    ),
+                )
+
+            clear_flow(context)
+            await message.reply_text(f"✅ تم حفظ زر «{flow['title']}» ويحتوي على {len(items_list)} مرفق بنجاح!")
             await show_admin_panel(update, context)
             return True
 
@@ -957,37 +1027,10 @@ async def process_admin_flow(
             return True
 
         content_type, value = content
-        user = update.effective_user
-        current_count = flow.get("saved_count", 0) + 1
-        item_title = flow["title"] if current_count == 1 else f"{flow['title']} ({current_count})"
-
-        db_execute(
-            """
-            INSERT INTO contents(
-                node_id, title, sort_order, layout_mode, content_type,
-                file_id, text_value,
-                created_by, source_chat_id, source_message_id
-            ) VALUES (?, ?, ?, 'half', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                flow["node_id"],
-                item_title,
-                max(
-                    (item["sort_order"] for item in menu_items(flow["node_id"])),
-                    default=-1,
-                )
-                + 1,
-                content_type,
-                value if content_type in {"document", "photo", "video", "audio"} else None,
-                value if content_type in {"text", "link"} else None,
-                user.id if user else 0,
-                message.chat_id,
-                message.message_id,
-            ),
-        )
-        flow["saved_count"] = current_count
+        items_list = flow.setdefault("items", [])
+        items_list.append({"type": content_type, "value": value})
         await message.reply_text(
-            f"📥 تم استلام الملف رقم ({current_count}). أرسل ملفاً آخر أو اضغط «✅ تم إنهاء الرفع»:",
+            f"📥 تم استلام المرفق رقم ({len(items_list)}).\nأرسل مرفقاً آخر لنفس الزر، أو اضغط «✅ تم إنهاء الرفع»:",
             reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
         return True
@@ -1030,9 +1073,10 @@ async def process_admin_flow(
                 "UPDATE contents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (text[:100], flow["content_id"]),
             )
-        set_flow(context, "edit_content_value", content_id=flow["content_id"])
+        set_flow(context, "edit_content_value", content_id=flow["content_id"], items=[])
         await message.reply_text(
-            "أرسل المحتوى الجديد، أو اكتب تخطي للاحتفاظ بالمحتوى الحالي."
+            "أرسل المحتوى/الملفات الجديدة ثم اضغط «✅ تم إنهاء الرفع»، أو اكتب تخطي للاحتفاظ بالمحتوى الحالي.",
+            reply_markup=keyboard([[DONE_UPLOAD], [SKIP], [tr(context, "cancel")]]),
         )
         return True
 
@@ -1042,28 +1086,62 @@ async def process_admin_flow(
             await message.reply_text("تم تعديل المحتوى.")
             await show_admin_panel(update, context)
             return True
+
+        if text == DONE_UPLOAD:
+            items_list = flow.get("items", [])
+            if not items_list:
+                clear_flow(context)
+                await message.reply_text("لم يتم تغيير المرفقات.")
+                await show_admin_panel(update, context)
+                return True
+
+            if len(items_list) == 1:
+                content_type = items_list[0]["type"]
+                val = items_list[0]["value"]
+                db_execute(
+                    """
+                    UPDATE contents
+                    SET content_type = ?, file_id = ?, text_value = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        content_type,
+                        val if content_type in {"document", "photo", "video", "audio"} else None,
+                        val if content_type in {"text", "link"} else None,
+                        flow["content_id"],
+                    ),
+                )
+            else:
+                db_execute(
+                    """
+                    UPDATE contents
+                    SET content_type = 'multi', file_id = NULL, text_value = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(items_list, ensure_ascii=False),
+                        flow["content_id"],
+                    ),
+                )
+            clear_flow(context)
+            await message.reply_text("تم تحديث المحتوى والمرفقات بنجاح.")
+            await show_admin_panel(update, context)
+            return True
+
         content = content_from_message(message)
         if content is None:
-            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً، أو اكتب تخطي.")
+            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً، أو اضغط ✅ تم إنهاء الرفع.")
             return True
+
         content_type, value = content
-        db_execute(
-            """
-            UPDATE contents
-            SET content_type = ?, file_id = ?, text_value = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (
-                content_type,
-                value if content_type in {"document", "photo", "video", "audio"} else None,
-                value if content_type in {"text", "link"} else None,
-                flow["content_id"],
-            ),
+        items_list = flow.setdefault("items", [])
+        items_list.append({"type": content_type, "value": value})
+        await message.reply_text(
+            f"📥 تم استلام المرفق ({len(items_list)}).\nأرسل مرفقاً آخر أو اضغط «✅ تم إنهاء الرفع»:",
+            reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
-        clear_flow(context)
-        await message.reply_text("تم تعديل المحتوى.")
-        await show_admin_panel(update, context)
         return True
 
     if flow_type == "add_admin":
