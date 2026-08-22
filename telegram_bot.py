@@ -1,5 +1,5 @@
 """
-Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub & Multi-Attachment Single Button.
+Telegram-only study-materials administration system - Ultra Fast & Edit Title Only Support.
 """
 
 from __future__ import annotations
@@ -10,8 +10,6 @@ import logging
 import os
 import re
 import sqlite3
-import subprocess
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +39,9 @@ CANCEL = "إلغاء"
 CONFIRM = "تأكيد"
 SKIP = "تخطي"
 DONE_UPLOAD = "✅ تم إنهاء الرفع"
+
+EDIT_TITLE_ONLY = "✏️ تعديل الاسم فقط"
+EDIT_TITLE_AND_FILES = "🔄 تعديل الاسم والملفات"
 
 STRINGS = {
     LANG_AR: {
@@ -121,42 +122,15 @@ def database_path() -> Path:
     return path
 
 
-DB = sqlite3.connect(database_path(), check_same_thread=False)
+DB = sqlite3.connect(database_path(), check_same_thread=False, timeout=15.0)
 DB.row_factory = sqlite3.Row
 DB.execute("PRAGMA foreign_keys = ON")
-
-GIT_SYNC_LOCK = threading.Lock()
-
-def sync_github_worker():
-    """يحفظ التغييرات في مستودع GitHub بأمان بدون تعارض أقفال"""
-    if not GIT_SYNC_LOCK.acquire(blocking=False):
-        return
-    try:
-        subprocess.run(["git", "config", "--global", "user.name", "GitHub Action Bot"], check=False)
-        subprocess.run(["git", "config", "--global", "user.email", "action@github.com"], check=False)
-        subprocess.run(["git", "add", "bot.sqlite3"], check=False)
-        res = subprocess.run(["git", "diff-index", "--quiet", "HEAD"], check=False)
-        if res.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "Realtime auto-save DB [skip ci]"], check=False)
-            subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
-            subprocess.run(["git", "push", "origin", "main"], check=False)
-    except Exception as e:
-        logger.error(f"Error syncing to GitHub: {e}")
-    finally:
-        GIT_SYNC_LOCK.release()
-
-
-def trigger_realtime_save():
-    threading.Thread(target=sync_github_worker, daemon=True).start()
+DB.execute("PRAGMA journal_mode = WAL")
 
 
 def db_execute(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
     with DB:
-        cursor = DB.execute(query, parameters)
-    q = query.strip().upper()
-    if q.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
-        trigger_realtime_save()
-    return cursor
+        return DB.execute(query, parameters)
 
 
 def db_one(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -590,7 +564,6 @@ def move_menu_item(
             f"UPDATE {target_table} SET sort_order = ? WHERE id = ?",
             (current["sort_order"], target["id"]),
         )
-    trigger_realtime_save()
     return True
 
 
@@ -747,7 +720,7 @@ async def deliver_content(update: Update, content: sqlite3.Row) -> None:
             c_val = item.get("value", "")
             sub_caption = f"{title}" if i == 0 else f"{title} (مرفق {i+1})"
             await deliver_single_item(message, c_type, c_val, sub_caption)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.04)
     else:
         value = content["file_id"] or content["text_value"] or ""
         await deliver_single_item(message, content_type, value, title)
@@ -795,7 +768,7 @@ async def send_broadcast(application: Application, message: Any) -> tuple[int, i
                     caption=f"📢 {message.caption or ''}",
                 )
             success += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
         except Exception:
             fail += 1
     return success, fail
@@ -956,7 +929,7 @@ async def process_admin_flow(
             items=[],
         )
         await message.reply_text(
-            f"تم تحديد الزر: {text}\n\nأرسل الملفات أو الروابط الآن واحداً تلو الآخر (سيتم جمعهم معاً في نفس الزر).\nعند الانتهاء اضغط على «✅ تم إنهاء الرفع».",
+            f"تم تحديد الزر: {text}\n\nأرسل الملفات أو الروابط الآن (سيتم جمعهم معاً في هذا الزر).\nعند الانتهاء اضغط على «✅ تم إنهاء الرفع».",
             reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
         return True
@@ -965,7 +938,7 @@ async def process_admin_flow(
         if text == DONE_UPLOAD:
             items_list = flow.get("items", [])
             if not items_list:
-                await message.reply_text("لم يتم إرسال أي ملفات أو روابط. تم الإلغاء.")
+                await message.reply_text("لم يتم إرسال أي ملفات أو روابط.")
                 clear_flow(context)
                 await show_admin_panel(update, context)
                 return True
@@ -1023,14 +996,14 @@ async def process_admin_flow(
 
         content = content_from_message(message)
         if content is None:
-            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً، أو اضغط ✅ تم إنهاء الرفع.")
+            await message.reply_text("أرسل ملفاً أو رابطاً، أو اضغط ✅ تم إنهاء الرفع.")
             return True
 
         content_type, value = content
         items_list = flow.setdefault("items", [])
         items_list.append({"type": content_type, "value": value})
         await message.reply_text(
-            f"📥 تم استلام المرفق رقم ({len(items_list)}).\nأرسل مرفقاً آخر لنفس الزر، أو اضغط «✅ تم إنهاء الرفع»:",
+            f"📥 تم استلام المرفق ({len(items_list)}).\nأرسل ملفاً آخر أو اضغط «✅ تم إنهاء الرفع»:",
             reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
         return True
@@ -1048,10 +1021,41 @@ async def process_admin_flow(
                 reply_markup=keyboard([[CONFIRM], [tr(context, "cancel")]]),
             )
         else:
+            set_flow(context, "choose_edit_mode", content_id=content_id)
+            await message.reply_text(
+                "اختر نوع التعديل الذي تريده:",
+                reply_markup=keyboard([[EDIT_TITLE_ONLY], [EDIT_TITLE_AND_FILES], [tr(context, "cancel")]]),
+            )
+        return True
+
+    if flow_type == "choose_edit_mode":
+        content_id = flow["content_id"]
+        if text == EDIT_TITLE_ONLY:
+            set_flow(context, "edit_content_title_only", content_id=content_id)
+            await message.reply_text("أرسل الاسم الجديد للمحتوى:", reply_markup=keyboard([[tr(context, "cancel")]]))
+            return True
+        elif text == EDIT_TITLE_AND_FILES:
             set_flow(context, "edit_content_title", content_id=content_id)
             await message.reply_text(
-                "أرسل العنوان الجديد، أو اكتب تخطي للاحتفاظ بالعنوان الحالي."
+                "أرسل العنوان الجديد، أو اكتب تخطي للاحتفاظ بالعنوان الحالي.",
+                reply_markup=keyboard([[SKIP], [tr(context, "cancel")]]),
             )
+            return True
+        else:
+            await message.reply_text("يرجى الاختيار من القائمة أدناه.")
+            return True
+
+    if flow_type == "edit_content_title_only":
+        if not text:
+            await message.reply_text("أرسل الاسم الجديد كنص.")
+            return True
+        db_execute(
+            "UPDATE contents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (text[:100], flow["content_id"]),
+        )
+        clear_flow(context)
+        await message.reply_text("✅ تم تعديل اسم المحتوى بنجاح!")
+        await show_admin_panel(update, context)
         return True
 
     if flow_type == "confirm_delete_content":
