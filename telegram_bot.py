@@ -1,5 +1,6 @@
 """
-Telegram-only study-materials administration system - Ultra Fast & Edit Title Only Support.
+Telegram study-materials administration system - Ultra Fast & Feature-Complete.
+Includes: Inline Buttons, Favorites, Recent Uploads, Cloning, Title Editing, and Menu Button.
 """
 
 from __future__ import annotations
@@ -13,9 +14,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -52,6 +60,8 @@ STRINGS = {
         "confirm": "تأكيد",
         "skip": "تخطي",
         "search_btn": "🔍 بحث سريع",
+        "fav_btn": "⭐ المفضلة",
+        "recent_btn": "🆕 أحدث الإضافات",
         "lang_btn": "🌐 English",
         "choose_lang": "اختر اللغة / Choose language:",
         "lang_changed": "تم تغيير اللغة إلى العربية بنجاح.",
@@ -71,6 +81,8 @@ STRINGS = {
         "confirm": "Confirm",
         "skip": "Skip",
         "search_btn": "🔍 Search",
+        "fav_btn": "⭐ Favorites",
+        "recent_btn": "🆕 Recent Uploads",
         "lang_btn": "🌐 عربي",
         "choose_lang": "Choose language / اختر اللغة:",
         "lang_changed": "Language changed to English successfully.",
@@ -87,6 +99,7 @@ STRINGS = {
 ADD_BUTTON = "إضافة زر"
 EDIT_CURRENT_BUTTON = "تعديل هذا الزر"
 DELETE_CURRENT_BUTTON = "حذف هذا الزر"
+CLONE_NODE_BUTTON = "📋 نسخ هيكل هذا الزر"
 ADD_CONTENT = "إضافة محتوى"
 EDIT_CONTENT = "تعديل محتوى"
 DELETE_CONTENT = "حذف محتوى"
@@ -199,6 +212,43 @@ def log_user_activity(user_id: int, action_type: str, item_title: str) -> None:
     )
 
 
+def is_favorite(user_id: int, content_id: int) -> bool:
+    row = db_one("SELECT id FROM favorites WHERE user_id = ? AND content_id = ?", (user_id, content_id))
+    return row is not None
+
+
+def toggle_favorite(user_id: int, content_id: int) -> bool:
+    if is_favorite(user_id, content_id):
+        db_execute("DELETE FROM favorites WHERE user_id = ? AND content_id = ?", (user_id, content_id))
+        return False
+    else:
+        db_execute("INSERT INTO favorites (user_id, content_id) VALUES (?, ?)", (user_id, content_id))
+        return True
+
+
+def clone_node_structure(source_node_id: int, target_parent_id: int | None, new_title: str) -> int:
+    with DB:
+        cursor = DB.execute(
+            "INSERT INTO menu_nodes (parent_id, title, sort_order, layout_mode) VALUES (?, ?, 0, 'half')",
+            (target_parent_id, new_title),
+        )
+        new_node_id = cursor.lastrowid
+
+    def copy_children(src_id: int, tgt_id: int):
+        children = db_all("SELECT * FROM menu_nodes WHERE parent_id = ?", (src_id,))
+        for child in children:
+            with DB:
+                c = DB.execute(
+                    "INSERT INTO menu_nodes (parent_id, title, sort_order, layout_mode) VALUES (?, ?, ?, ?)",
+                    (tgt_id, child["title"], child["sort_order"], child["layout_mode"]),
+                )
+                child_new_id = c.lastrowid
+            copy_children(child["id"], child_new_id)
+
+    copy_children(source_node_id, new_node_id)
+    return new_node_id
+
+
 def initialize_database() -> None:
     with DB:
         DB.executescript(
@@ -258,6 +308,14 @@ def initialize_database() -> None:
                 action_type TEXT NOT NULL,
                 item_title TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                content_id INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, content_id)
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -441,7 +499,8 @@ async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         rows.append(navigation_row)
 
     if node_id is None:
-        rows.append([tr(context, "search_btn"), tr(context, "lang_btn")])
+        rows.append([tr(context, "search_btn"), tr(context, "fav_btn")])
+        rows.append([tr(context, "recent_btn"), tr(context, "lang_btn")])
 
     if is_admin(update):
         rows.append([tr(context, "admin_menu")])
@@ -462,14 +521,21 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if message is None:
         return
 
+    node_id = current_node_id(context)
     rows = [
         [ADD_BUTTON],
         [EDIT_CURRENT_BUTTON, DELETE_CURRENT_BUTTON],
+    ]
+
+    if node_id is not None:
+        rows.append([CLONE_NODE_BUTTON])
+
+    rows.extend([
         [ARRANGE_BUTTONS],
         [ADD_CONTENT],
         [EDIT_CONTENT, DELETE_CONTENT],
         [BROADCAST_BUTTON, STATS_BUTTON],
-    ]
+    ])
 
     if is_super_admin(update):
         rows.append([USERS_LIST_BUTTON, ACTIVITY_LOG_BUTTON])
@@ -477,7 +543,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     rows.append([BACK_TO_MENU])
 
-    location = node_title(current_node_id(context))
+    location = node_title(node_id)
     await message.reply_text(
         tr(context, "admin_location", loc=location),
         reply_markup=keyboard(rows),
@@ -683,31 +749,51 @@ def content_from_message(message: Any) -> tuple[str, str] | None:
     return None
 
 
-async def deliver_single_item(message: Any, c_type: str, c_val: str, caption: str) -> None:
+def get_content_inline_markup(user_id: int, content_id: int) -> InlineKeyboardMarkup:
+    fav_text = "⭐ إزالة من المفضلة" if is_favorite(user_id, content_id) else "⭐ حفظ في المفضلة"
+    inline_k = [
+        [
+            InlineKeyboardButton(fav_text, callback_data=f"fav_{content_id}"),
+            InlineKeyboardButton("⚠️ إبلاغ عن مشكلة", callback_data=f"rep_{content_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_k)
+
+
+async def deliver_single_item(
+    message: Any,
+    c_type: str,
+    c_val: str,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     try:
         if c_type == "document":
-            await message.reply_document(document=c_val, caption=caption)
+            await message.reply_document(document=c_val, caption=caption, reply_markup=reply_markup)
         elif c_type == "photo":
-            await message.reply_photo(photo=c_val, caption=caption)
+            await message.reply_photo(photo=c_val, caption=caption, reply_markup=reply_markup)
         elif c_type == "video":
-            await message.reply_video(video=c_val, caption=caption)
+            await message.reply_video(video=c_val, caption=caption, reply_markup=reply_markup)
         elif c_type == "audio":
-            await message.reply_audio(audio=c_val, caption=caption)
+            await message.reply_audio(audio=c_val, caption=caption, reply_markup=reply_markup)
         elif c_type == "link":
-            await message.reply_text(f"{caption}\n\n{c_val}", disable_web_page_preview=False)
+            await message.reply_text(f"{caption}\n\n{c_val}", disable_web_page_preview=False, reply_markup=reply_markup)
         else:
-            await message.reply_text(f"{caption}\n\n{c_val}")
+            await message.reply_text(f"{caption}\n\n{c_val}", reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error delivering item: {e}")
 
 
 async def deliver_content(update: Update, content: sqlite3.Row) -> None:
     message = update.effective_message
-    if message is None:
+    user = update.effective_user
+    if message is None or user is None:
         return
 
     title = content["title"]
     content_type = content["content_type"]
+    content_id = content["id"]
+    inline_markup = get_content_inline_markup(user.id, content_id)
 
     if content_type == "multi":
         items = []
@@ -719,11 +805,57 @@ async def deliver_content(update: Update, content: sqlite3.Row) -> None:
             c_type = item.get("type", "text")
             c_val = item.get("value", "")
             sub_caption = f"{title}" if i == 0 else f"{title} (مرفق {i+1})"
-            await deliver_single_item(message, c_type, c_val, sub_caption)
+            is_last = (i == len(items) - 1)
+            await deliver_single_item(
+                message,
+                c_type,
+                c_val,
+                sub_caption,
+                reply_markup=inline_markup if is_last else None,
+            )
             await asyncio.sleep(0.04)
     else:
         value = content["file_id"] or content["text_value"] or ""
-        await deliver_single_item(message, content_type, value, title)
+        await deliver_single_item(message, content_type, value, title, reply_markup=inline_markup)
+
+
+async def show_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    favs = db_all(
+        """
+        SELECT c.* FROM contents c
+        INNER JOIN favorites f ON c.id = f.content_id
+        WHERE f.user_id = ?
+        ORDER BY f.id DESC
+        """,
+        (user.id,),
+    )
+    if not favs:
+        await update.effective_message.reply_text("⭐ ليس لديك أي ملفات محفوظة في المفضلة بعد.")
+        return
+
+    await update.effective_message.reply_text(f"⭐ قائمة ملفاتك المفضلة ({len(favs)}):")
+    for content in favs:
+        await deliver_content(update, content)
+
+
+async def show_recent_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    recent = db_all(
+        """
+        SELECT * FROM contents
+        ORDER BY id DESC
+        LIMIT 10
+        """
+    )
+    if not recent:
+        await update.effective_message.reply_text("🆕 لم يتم رفع أي محتوى بعد.")
+        return
+
+    await update.effective_message.reply_text("🆕 أحدث 10 محاضرات وملفات تم إضافتها:")
+    for content in recent:
+        await deliver_content(update, content)
 
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
@@ -772,6 +904,45 @@ async def send_broadcast(application: Application, message: Any) -> tuple[int, i
         except Exception:
             fail += 1
     return success, fail
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data.startswith("fav_"):
+        content_id = int(data.split("_")[1])
+        is_fav = toggle_favorite(user_id, content_id)
+        msg = "✅ تم الحفظ في المفضلة!" if is_fav else "❌ تمت الإزالة من المفضلة!"
+        await query.answer(msg, show_alert=False)
+        try:
+            new_markup = get_content_inline_markup(user_id, content_id)
+            await query.edit_message_reply_markup(reply_markup=new_markup)
+        except Exception:
+            pass
+
+    elif data.startswith("rep_"):
+        content_id = int(data.split("_")[1])
+        content = db_one("SELECT title FROM contents WHERE id = ?", (content_id,))
+        title = content["title"] if content else f"ID: {content_id}"
+        await query.answer("تم إرسال بلاغك للإدارة بنجاح، شكراً لك!", show_alert=True)
+
+        raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
+        admin_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
+        user_name = update.effective_user.first_name or f"User {user_id}"
+        username = f"@{update.effective_user.username}" if update.effective_user.username else ""
+        for a_id in admin_ids:
+            try:
+                await context.application.bot.send_message(
+                    chat_id=a_id,
+                    text=f"⚠️ بلاغ عن مشكلة في محتوى:\n\n• المحتوى: {title}\n• أرسل بواسطة: {user_name} ({username})\n• ID: `{user_id}`",
+                )
+            except Exception:
+                pass
 
 
 async def process_admin_flow(
@@ -824,6 +995,18 @@ async def process_admin_flow(
         await status_msg.edit_text(
             f"✅ تم إرسال الإذاعة بنجاح!\n\n• وصل إلى: {succ} طالب\n• فشل: {fail}"
         )
+        await show_admin_panel(update, context)
+        return True
+
+    if flow_type == "clone_node_name":
+        if not text:
+            await message.reply_text("أرسل اسم النسخة الجديدة كنص.")
+            return True
+        src_id = flow["source_id"]
+        parent_id = flow["parent_id"]
+        clone_node_structure(src_id, parent_id, text[:64])
+        clear_flow(context)
+        await message.reply_text(f"✅ تم نسخ هيكل المادة/الزر بالكامل بنجاح باسم «{text}»!")
         await show_admin_panel(update, context)
         return True
 
@@ -1286,6 +1469,14 @@ async def handle_navigation(
         await show_node(update, context)
         return
 
+    if text in {STRINGS[LANG_AR]["fav_btn"], STRINGS[LANG_EN]["fav_btn"]}:
+        await show_favorites(update, context)
+        return
+
+    if text in {STRINGS[LANG_AR]["recent_btn"], STRINGS[LANG_EN]["recent_btn"]}:
+        await show_recent_uploads(update, context)
+        return
+
     if text in {STRINGS[LANG_AR]["main_menu"], STRINGS[LANG_EN]["main_menu"]}:
         context.user_data["menu_path"] = []
         await show_node(update, context)
@@ -1318,6 +1509,19 @@ async def handle_navigation(
         set_flow(context, "add_button")
         await message.reply_text(
             f"أرسل اسم الزر الجديد داخل: {node_title(current_node_id(context))}",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+        )
+        return
+    if text == CLONE_NODE_BUTTON and is_admin(update):
+        node_id = current_node_id(context)
+        if node_id is None:
+            await message.reply_text("لا يمكن نسخ القائمة الرئيسية.")
+            return
+        parent_row = db_one("SELECT parent_id, title FROM menu_nodes WHERE id = ?", (node_id,))
+        parent_id = parent_row["parent_id"] if parent_row else None
+        set_flow(context, "clone_node_name", source_id=node_id, parent_id=parent_id)
+        await message.reply_text(
+            f"📋 سيتم نسخ هيكل وتفريعات «{parent_row['title']}» بالكامل.\n\nأرسل اسم المادة/الزر الجديد:",
             reply_markup=keyboard([[tr(context, "cancel")]]),
         )
         return
@@ -1354,11 +1558,13 @@ async def handle_navigation(
         user_count = db_one("SELECT COUNT(*) AS total FROM users")["total"]
         node_count = db_one("SELECT COUNT(*) AS total FROM menu_nodes")["total"]
         content_count = db_one("SELECT COUNT(*) AS total FROM contents")["total"]
+        fav_count = db_one("SELECT COUNT(*) AS total FROM favorites")["total"]
         await message.reply_text(
             f"📊 إحصائيات البوت:\n\n"
             f"👥 عدد الطلاب المشتركين: {user_count}\n"
             f"📁 عدد الأقسام والمواد: {node_count}\n"
-            f"📄 إجمالي الملفات والمحاضرات: {content_count}"
+            f"📄 إجمالي الملفات والمحاضرات: {content_count}\n"
+            f"⭐ إجمالي الإضافات للمفضلة: {fav_count}"
         )
         await show_admin_panel(update, context)
         return
@@ -1510,6 +1716,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await handle_navigation(update, context)
 
 
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands([
+        BotCommand("start", "القائمة الرئيسية / Restart bot"),
+        BotCommand("search", "بحث سريع عن مادة أو محاضرة"),
+        BotCommand("cancel", "إلغاء العملية والعودة للرئيسية"),
+    ])
+
+
 def build_application() -> Application:
     token = os.getenv(TOKEN_ENV_VAR)
     if not token:
@@ -1520,10 +1734,11 @@ def build_application() -> Application:
     initialize_database()
     bootstrap_admins()
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("cancel", start))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
     )
