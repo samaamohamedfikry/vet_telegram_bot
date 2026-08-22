@@ -1,5 +1,5 @@
 """
-Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub.
+Telegram-only study-materials administration system with Thread-Safe Real-time Auto-Save to GitHub & Multi-file Upload.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ LANG_EN = "en"
 CANCEL = "إلغاء"
 CONFIRM = "تأكيد"
 SKIP = "تخطي"
+DONE_UPLOAD = "✅ تم إنهاء الرفع"
 
 STRINGS = {
     LANG_AR: {
@@ -931,20 +932,35 @@ async def process_admin_flow(
             "add_content_value",
             title=text[:100],
             node_id=current_node_id(context),
+            saved_count=0,
         )
         await message.reply_text(
-            "أرسل الملف أو الصورة أو الفيديو أو الصوت أو الرابط أو النص الآن.",
-            reply_markup=keyboard([[tr(context, "cancel")]]),
+            "أرسل الملفات الآن (يمكنك إرسال أكثر من ملف).\nعند الانتهاء اضغط على «✅ تم إنهاء الرفع».",
+            reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
         )
         return True
 
     if flow_type == "add_content_value":
+        if text == DONE_UPLOAD:
+            count = flow.get("saved_count", 0)
+            clear_flow(context)
+            if count > 0:
+                await message.reply_text(f"✅ تم حفظ {count} ملف/عنصر بنجاح.")
+            else:
+                await message.reply_text("لم يتم إرسال أي ملفات.")
+            await show_admin_panel(update, context)
+            return True
+
         content = content_from_message(message)
         if content is None:
-            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً.")
+            await message.reply_text("أرسل ملفاً أو رابطاً أو نصاً، أو اضغط ✅ تم إنهاء الرفع.")
             return True
+
         content_type, value = content
         user = update.effective_user
+        current_count = flow.get("saved_count", 0) + 1
+        item_title = flow["title"] if current_count == 1 else f"{flow['title']} ({current_count})"
+
         db_execute(
             """
             INSERT INTO contents(
@@ -955,7 +971,7 @@ async def process_admin_flow(
             """,
             (
                 flow["node_id"],
-                flow["title"],
+                item_title,
                 max(
                     (item["sort_order"] for item in menu_items(flow["node_id"])),
                     default=-1,
@@ -969,9 +985,11 @@ async def process_admin_flow(
                 message.message_id,
             ),
         )
-        clear_flow(context)
-        await message.reply_text("تمت إضافة المحتوى.")
-        await show_admin_panel(update, context)
+        flow["saved_count"] = current_count
+        await message.reply_text(
+            f"📥 تم استلام الملف رقم ({current_count}). أرسل ملفاً آخر أو اضغط «✅ تم إنهاء الرفع»:",
+            reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
+        )
         return True
 
     if flow_type in {"edit_content", "delete_content"}:
