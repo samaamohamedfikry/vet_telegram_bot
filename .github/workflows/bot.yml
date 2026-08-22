@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: '0 */5 * * *' # تشغيل مجدول احتياطي
 
+# يمنع تشغيل أكثر من سيرفر في نفس اللحظة نهائياً
+concurrency:
+  group: telegram-bot-runner
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -46,7 +51,7 @@ jobs:
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          git add bot.sqlite3
+          git add bot.sqlite3*
           if ! git diff-index --quiet HEAD; then
             git commit -m "Auto-save DB on exit [skip ci]"
             git pull --rebase origin main || true
@@ -54,7 +59,7 @@ jobs:
           fi
 
       - name: Trigger Next Session (24/7 Loop)
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
