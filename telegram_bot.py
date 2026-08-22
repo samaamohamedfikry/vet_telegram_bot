@@ -138,7 +138,8 @@ def database_path() -> Path:
 DB = sqlite3.connect(database_path(), check_same_thread=False, timeout=15.0)
 DB.row_factory = sqlite3.Row
 DB.execute("PRAGMA foreign_keys = ON")
-DB.execute("PRAGMA journal_mode = WAL")
+DB.execute("PRAGMA journal_mode = DELETE")
+DB.execute("PRAGMA synchronous = FULL")
 
 
 def db_execute(query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Cursor:
