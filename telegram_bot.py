@@ -1,6 +1,7 @@
 """
 Telegram study-materials administration system - Ultra Fast & Feature-Complete.
-Includes: Inline Buttons, Favorites, Recent Uploads, Cloning, Title Editing, and Menu Button.
+Includes: Interactive Report System, Inline Buttons, Favorites, Recent Uploads, 
+Cloning, Title Editing, Blue Menu Button, and Study Duas.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 from pathlib import Path
@@ -18,6 +20,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonCommands,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -50,6 +53,18 @@ DONE_UPLOAD = "✅ تم إنهاء الرفع"
 
 EDIT_TITLE_ONLY = "✏️ تعديل الاسم فقط"
 EDIT_TITLE_AND_FILES = "🔄 تعديل الاسم والملفات"
+
+STUDY_DUAS = [
+    "اللهم لا سهل إلا ما جعلته سهلاً، وأنت تجعل الحزن إذا شئت سهلاً 🤲✨",
+    "اللهم إني أسألك فهم النبيين، وحفظ المرسلين، والملائكة المقربين 📖🌸",
+    "اللهم انفعني بما علمتني، وعلمني ما ينفعني، وزدني علماً 🌟",
+    "ربِّ اشرح لي صدري ويسر لي أمري واحلل عقدة من لساني يفقهوا قولي 🤍",
+    "اللهم إني أستودعك ما قرأت وما حفظت وما تعلمت، فرده عند حاجتي إليه يا رب العالمين 🤲🌷",
+    "اللهم افتح لي أبواب حكمتك، وانشر عليّ رحمتك، وامنن عليّ بالحفظ والفهم 💫",
+    "اللهم يسّر لي كل عسير، ووفقني وافتح عليّ فتوح العارفين 🌿✨",
+    "يا حي يا قيوم برحمتك أستغيث، أصلح لي شأني كله ولا تكلني إلى نفسي طرفة عين 🤲",
+    "اللهم بارك لي في وقتي وجهدي، واجعل دراستي هذه طريقاً لرفعتي ونفع الناس 🩺🤍",
+]
 
 STRINGS = {
     LANG_AR: {
@@ -785,11 +800,17 @@ async def deliver_single_item(
         logger.error(f"Error delivering item: {e}")
 
 
-async def deliver_content(update: Update, content: sqlite3.Row) -> None:
+async def deliver_content(update: Update, content: sqlite3.Row, send_dua: bool = False) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
+
+    # إرسال دعاء مذاكرة وتوفيق قبل الملف
+    if send_dua:
+        dua = random.choice(STUDY_DUAS)
+        await message.reply_text(f"📖 **دعاء وتوفيق:**\n\n« {dua} »", parse_mode="Markdown")
+        await asyncio.sleep(0.3)
 
     title = content["title"]
     content_type = content["content_type"]
@@ -839,7 +860,7 @@ async def show_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.effective_message.reply_text(f"⭐ قائمة ملفاتك المفضلة ({len(favs)}):")
     for content in favs:
-        await deliver_content(update, content)
+        await deliver_content(update, content, send_dua=False)
 
 
 async def show_recent_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -856,7 +877,7 @@ async def show_recent_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.effective_message.reply_text("🆕 أحدث 10 محاضرات وملفات تم إضافتها:")
     for content in recent:
-        await deliver_content(update, content)
+        await deliver_content(update, content, send_dua=False)
 
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
@@ -874,7 +895,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
 
     await update.effective_message.reply_text(tr(context, "search_results", query=query))
     for content in results:
-        await deliver_content(update, content)
+        await deliver_content(update, content, send_dua=False)
 
 
 async def send_broadcast(application: Application, message: Any) -> tuple[int, int]:
@@ -930,20 +951,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         content_id = int(data.split("_")[1])
         content = db_one("SELECT title FROM contents WHERE id = ?", (content_id,))
         title = content["title"] if content else f"ID: {content_id}"
-        await query.answer("تم إرسال بلاغك للإدارة بنجاح، شكراً لك!", show_alert=True)
+        
+        set_flow(context, "submit_report", content_id=content_id, content_title=title)
+        await query.message.reply_text(
+            f"⚠️ **الإبلاغ عن مشكلة في:** «{title}»\n\n"
+            "يرجى كتابة تفاصيل المشكلة أو الملاحظة الآن (مثال: الرابط لا يعمل، الملف ناقص، الصوت ضعيف):",
+            reply_markup=keyboard([[tr(context, "cancel")]]),
+            parse_mode="Markdown"
+        )
 
-        raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
-        admin_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
-        user_name = update.effective_user.first_name or f"User {user_id}"
-        username = f"@{update.effective_user.username}" if update.effective_user.username else ""
-        for a_id in admin_ids:
-            try:
-                await context.application.bot.send_message(
-                    chat_id=a_id,
-                    text=f"⚠️ بلاغ عن مشكلة في محتوى:\n\n• المحتوى: {title}\n• أرسل بواسطة: {user_name} ({username})\n• ID: `{user_id}`",
-                )
-            except Exception:
-                pass
+    elif data.startswith("reply_user_"):
+        target_user_id = int(data.split("_")[2])
+        set_flow(context, "admin_reply_to_student", target_user_id=target_user_id)
+        await query.message.reply_text(
+            f"✍️ اكتب الرسالة التي تريد إرسالها للطالب مباشرة:",
+            reply_markup=keyboard([[tr(context, "cancel")]])
+        )
 
 
 async def process_admin_flow(
@@ -974,6 +997,67 @@ async def process_admin_flow(
         return True
 
     flow_type = flow["type"]
+
+    if flow_type == "submit_report":
+        if not text:
+            await message.reply_text("يرجى كتابة تفاصيل المشكلة كنص.")
+            return True
+        
+        content_title = flow.get("content_title", "محتوى دراسي")
+        user = update.effective_user
+        user_id = user.id if user else 0
+        user_name = user.first_name if user else "طالب"
+        username = f"@{user.username}" if user and user.username else "بدون يوزر"
+
+        raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
+        admin_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
+        
+        admin_report_msg = (
+            f"🚨 **بلاغ جديد عن مشكلة في المحتوى:**\n\n"
+            f"• **المحتوى:** {content_title}\n"
+            f"• **الطالب:** {user_name} ({username})\n"
+            f"• **ID:** `{user_id}`\n\n"
+            f"📝 **نص الشكوى / الملاحظة:**\n"
+            f"« {text} »"
+        )
+        
+        reply_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 الرد على الطالب", callback_data=f"reply_user_{user_id}")]
+        ])
+
+        for a_id in admin_ids:
+            try:
+                await context.application.bot.send_message(
+                    chat_id=a_id,
+                    text=admin_report_msg,
+                    parse_mode="Markdown",
+                    reply_markup=reply_kb
+                )
+            except Exception:
+                pass
+
+        clear_flow(context)
+        await message.reply_text("✅ تم إرسال ملاحظتك وتفاصيل المشكلة للإدارة بنجاح، شكراً لتعاونك!")
+        await show_node(update, context)
+        return True
+
+    if flow_type == "admin_reply_to_student" and is_admin(update):
+        if not text:
+            await message.reply_text("يرجى كتابة نص الرد.")
+            return True
+        target_user_id = flow["target_user_id"]
+        try:
+            await context.application.bot.send_message(
+                chat_id=target_user_id,
+                text=f"📩 **رد من إدارة البوت بخصوص بلاغك:**\n\n{text}",
+                parse_mode="Markdown"
+            )
+            await message.reply_text("✅ تم إرسال ردك للطالب بنجاح.")
+        except Exception as e:
+            await message.reply_text(f"❌ تعذر إرسال الرد للطالب: {e}")
+        clear_flow(context)
+        await show_admin_panel(update, context)
+        return True
 
     if flow_type == "search":
         if not text:
@@ -1702,7 +1786,7 @@ async def handle_navigation(
             if content:
                 if update.effective_user and not is_admin(update):
                     log_user_activity(update.effective_user.id, "محاضرة / ملف", content["title"])
-                await deliver_content(update, content)
+                await deliver_content(update, content, send_dua=True)
                 return
 
     await message.reply_text(tr(context, "select_from_menu"))
@@ -1723,6 +1807,7 @@ async def post_init(application: Application) -> None:
         BotCommand("search", "بحث سريع عن مادة أو محاضرة"),
         BotCommand("cancel", "إلغاء العملية والعودة للرئيسية"),
     ])
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 def build_application() -> Application:
