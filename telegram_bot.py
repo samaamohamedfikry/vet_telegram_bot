@@ -58,7 +58,7 @@ STUDY_DUAS = [
     "اللهم لا سهل إلا ما جعلته سهلاً، وأنت تجعل الحزن إذا شئت سهلاً 🤲✨",
     "اللهم إني أسألك فهم النبيين، وحفظ المرسلين، والملائكة المقربين 📖🌸",
     "اللهم انفعني بما علمتني، وعلمني ما ينفعني، وزدني علماً 🌟",
-    "ربِّ اشرح لي صدري ويسر لي أمري واحلل عقدة من لساني يفقهوا قولي 🤍",
+    "ربِّ اشرح لي صدري ويسر لي أمري واحلل عقدة من لساني يفقهوا قولي 🤍",
     "اللهم إني أستودعك ما قرأت وما حفظت وما تعلمت، فرده عند حاجتي إليه يا رب العالمين 🤲🌷",
     "اللهم افتح لي أبواب حكمتك، وانشر عليّ رحمتك، وامنن عليّ بالحفظ والفهم 💫",
     "اللهم يسّر لي كل عسير، ووفقني وافتح عليّ فتوح العارفين 🌿✨",
@@ -85,7 +85,7 @@ STRINGS = {
         "no_search_results": "عفواً، لم أجد نتائج مطابقة لبحثك.",
         "select_from_menu": "اختر من القائمة:",
         "admin_location": "لوحة الإدارة\nالموقع الحالي: {loc}\n\nاختر إجراءً:",
-        "no_permission": "ليس لديك صلاحية للوصول إلى لوحة الإدارة.",
+        "no_permission": "ليس لديك صلاحية للوصول إلى هذا الإجراء.",
         "canceled": "تم الإلغاء.",
     },
     LANG_EN: {
@@ -106,7 +106,7 @@ STRINGS = {
         "no_search_results": "Sorry, no results matched your search.",
         "select_from_menu": "Select from menu:",
         "admin_location": "Admin Panel\nCurrent Location: {loc}\n\nChoose an action:",
-        "no_permission": "You do not have admin permissions.",
+        "no_permission": "You do not have permission for this action.",
         "canceled": "Canceled.",
     }
 }
@@ -356,17 +356,13 @@ def bootstrap_admins() -> None:
     existing = db_one("SELECT id FROM admins LIMIT 1")
 
     if not existing and not configured_ids:
-        raise RuntimeError(
-            f"Set {ADMIN_IDS_ENV_VAR} to at least one Telegram user ID before the first run."
-        )
+        return
 
     for raw_id in configured_ids:
         try:
             user_id = int(raw_id)
-        except ValueError as error:
-            raise RuntimeError(
-                f"Invalid admin user ID in {ADMIN_IDS_ENV_VAR}: {raw_id}"
-            ) from error
+        except ValueError:
+            continue
         db_execute(
             """
             INSERT INTO admins(user_id, display_name)
@@ -413,7 +409,11 @@ def is_super_admin(update: Update) -> bool:
         return False
     raw_ids = os.getenv(ADMIN_IDS_ENV_VAR, "")
     configured_ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
-    return str(user.id) in configured_ids
+    if configured_ids:
+        return str(user.id) in configured_ids
+    # إذا لم يتم تمرير المتغير نعتمد على أول حساب مسجل في جدول المشرفين
+    first_admin = db_one("SELECT user_id FROM admins ORDER BY id ASC LIMIT 1")
+    return bool(first_admin and first_admin["user_id"] == user.id)
 
 
 def is_admin(update: Update) -> bool:
@@ -806,7 +806,6 @@ async def deliver_content(update: Update, content: sqlite3.Row, send_dua: bool =
     if message is None or user is None:
         return
 
-    # إرسال دعاء مذاكرة وتوفيق قبل الملف
     if send_dua:
         dua = random.choice(STUDY_DUAS)
         await message.reply_text(f"📖 **دعاء وتوفيق:**\n\n« {dua} »", parse_mode="Markdown")
@@ -1654,27 +1653,40 @@ async def handle_navigation(
         await show_admin_panel(update, context)
         return
 
-    if text == USERS_LIST_BUTTON and is_super_admin(update):
+    if text == USERS_LIST_BUTTON:
+        if not is_super_admin(update):
+            await message.reply_text("⚠️ هذا الإجراء مخصص لمالكة البوت فقط.")
+            return
+
         users = db_all(
             "SELECT user_id, username, first_name, joined_at FROM users ORDER BY joined_at DESC"
         )
         if not users:
             await message.reply_text("لا يوجد مستخدمون مسجلون بعد.")
+            await show_admin_panel(update, context)
             return
-        
-        current_chunk = f"👥 إجمالي الطلاب المشتركين: {len(users)}\n\n"
+
+        await message.reply_text(f"👥 إجمالي الطلاب المشتركين: {len(users)}\nجاري إرسال القوائم...")
+
+        current_chunk = ""
+        part = 1
         for i, u in enumerate(users, 1):
             uname = f"@{u['username']}" if u["username"] else "بدون يوزر"
-            name = (u["first_name"] or "مجهول").replace("`", "")
-            line = f"{i}. {name} ({uname}) | ID: `{u['user_id']}`\n"
-            if len(current_chunk) + len(line) > 3900:
-                await message.reply_text(current_chunk, parse_mode="Markdown")
+            name = (u["first_name"] or "مجهول").replace("\n", " ").strip()
+            line = f"{i}. {name} ({uname}) — ID: {u['user_id']}\n"
+            
+            # تقطيع الرسائل لتفادي تجاوز حد الـ 4096 حرف لكل رسالة
+            if len(current_chunk) + len(line) > 3000:
+                await message.reply_text(f"📋 قائمة المشتركين (الجزء {part}):\n\n{current_chunk}")
+                part += 1
                 current_chunk = ""
+                await asyncio.sleep(0.3)
+                
             current_chunk += line
-            
+
         if current_chunk:
-            await message.reply_text(current_chunk, parse_mode="Markdown")
-            
+            await message.reply_text(f"📋 قائمة المشتركين (الجزء {part}):\n\n{current_chunk}")
+
         await show_admin_panel(update, context)
         return
 
