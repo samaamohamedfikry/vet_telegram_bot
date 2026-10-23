@@ -51,8 +51,9 @@ CONFIRM = "تأكيد"
 SKIP = "تخطي"
 DONE_UPLOAD = "✅ تم إنهاء الرفع"
 
+ADD_MORE_FILES = "➕ إضافة ملفات للمحتوى الحالي"
 EDIT_TITLE_ONLY = "✏️ تعديل الاسم فقط"
-EDIT_TITLE_AND_FILES = "🔄 تعديل الاسم والملفات"
+EDIT_TITLE_AND_FILES = "🔄 استبدال الملفات بالكامل"
 
 STUDY_DUAS = [
     "اللهم لا سهل إلا ما جعلته سهلاً، وأنت تجعل الحزن إذا شئت سهلاً 🤲✨",
@@ -411,7 +412,6 @@ def is_super_admin(update: Update) -> bool:
     configured_ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
     if configured_ids:
         return str(user.id) in configured_ids
-    # إذا لم يتم تمرير المتغير نعتمد على أول حساب مسجل في جدول المشرفين
     first_admin = db_one("SELECT user_id FROM admins ORDER BY id ASC LIMIT 1")
     return bool(first_admin and first_admin["user_id"] == user.id)
 
@@ -1291,16 +1291,45 @@ async def process_admin_flow(
             set_flow(context, "choose_edit_mode", content_id=content_id)
             await message.reply_text(
                 "اختر نوع التعديل الذي تريده:",
-                reply_markup=keyboard([[EDIT_TITLE_ONLY], [EDIT_TITLE_AND_FILES], [tr(context, "cancel")]]),
+                reply_markup=keyboard([
+                    [ADD_MORE_FILES],
+                    [EDIT_TITLE_ONLY], 
+                    [EDIT_TITLE_AND_FILES], 
+                    [tr(context, "cancel")]
+                ]),
             )
         return True
 
     if flow_type == "choose_edit_mode":
         content_id = flow["content_id"]
-        if text == EDIT_TITLE_ONLY:
+        if text == ADD_MORE_FILES:
+            content = db_one("SELECT content_type, file_id, text_value FROM contents WHERE id = ?", (content_id,))
+            existing_items = []
+            if content:
+                c_type = content["content_type"]
+                if c_type == "multi":
+                    try:
+                        existing_items = json.loads(content["text_value"] or "[]")
+                    except Exception:
+                        existing_items = []
+                else:
+                    val = content["file_id"] or content["text_value"] or ""
+                    if val:
+                        existing_items = [{"type": c_type, "value": val}]
+
+            set_flow(context, "edit_content_value", content_id=content_id, items=existing_items)
+            await message.reply_text(
+                f"إضافة مرفقات للمحتوى الحالي (يوجد حالياً {len(existing_items)} مرفق).\n\n"
+                "أرسل الملفات أو الروابط الجديدة الآن، وعند الانتهاء اضغط «✅ تم إنهاء الرفع»:",
+                reply_markup=keyboard([[DONE_UPLOAD], [tr(context, "cancel")]]),
+            )
+            return True
+
+        elif text == EDIT_TITLE_ONLY:
             set_flow(context, "edit_content_title_only", content_id=content_id)
             await message.reply_text("أرسل الاسم الجديد للمحتوى:", reply_markup=keyboard([[tr(context, "cancel")]]))
             return True
+
         elif text == EDIT_TITLE_AND_FILES:
             set_flow(context, "edit_content_title", content_id=content_id)
             await message.reply_text(
@@ -1503,6 +1532,17 @@ async def process_admin_flow(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_flow(context)
     context.user_data["menu_path"] = []
+    
+    # تثبيت وإظهار زر Menu الأزرق رسمياً للمستخدم
+    try:
+        if update.effective_chat:
+            await context.bot.set_chat_menu_button(
+                chat_id=update.effective_chat.id,
+                menu_button=MenuButtonCommands()
+            )
+    except Exception:
+        pass
+
     if update.effective_user:
         user_id = update.effective_user.id
         track_user(
@@ -1675,7 +1715,6 @@ async def handle_navigation(
             name = (u["first_name"] or "مجهول").replace("\n", " ").strip()
             line = f"{i}. {name} ({uname}) — ID: {u['user_id']}\n"
             
-            # تقطيع الرسائل لتفادي تجاوز حد الـ 4096 حرف لكل رسالة
             if len(current_chunk) + len(line) > 3000:
                 await message.reply_text(f"📋 قائمة المشتركين (الجزء {part}):\n\n{current_chunk}")
                 part += 1
@@ -1819,7 +1858,10 @@ async def post_init(application: Application) -> None:
         BotCommand("search", "بحث سريع عن مادة أو محاضرة"),
         BotCommand("cancel", "إلغاء العملية والعودة للرئيسية"),
     ])
-    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    try:
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        logger.error(f"Error setting menu button in post_init: {e}")
 
 
 def build_application() -> Application:
